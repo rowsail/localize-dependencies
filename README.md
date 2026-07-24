@@ -53,8 +53,7 @@ reads that back and deletes anything the run created.
 ### From the Plugin and Content Manager
 
 *Tools > Plugin and Content Manager > Plugins*, find Localize Dependencies,
-install it, and restart the PCB editor. (Pending acceptance into the official
-repository.)
+install it, and restart the PCB editor.
 
 ### Manually
 
