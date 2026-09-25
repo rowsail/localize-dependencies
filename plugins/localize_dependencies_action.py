@@ -303,7 +303,10 @@ class LocalizeDialog(wx.Dialog):
             session.save_manifest(result)
         except Exception as exc:
             del busy
-            self._msg("Localize failed (no changes kept):\n{}".format(exc),
+            self.refresh()
+            self._msg("Localize failed part-way:\n{}\n\n"
+                      "Every change made before the error is recorded. "
+                      "Click Revert to undo them.".format(exc),
                       wx.OK | wx.ICON_ERROR)
             return
         del busy
@@ -336,9 +339,22 @@ class LocalizeDialog(wx.Dialog):
             wx.YES_NO | wx.ICON_QUESTION,
         ) != wx.YES:
             return
+        force = False
+        conflicts = portability.revert_conflicts(self.project_dir)
+        if conflicts:
+            answer = self._msg(
+                "These files changed after they were localized:\n\n" +
+                "\n".join(conflicts[:15]) +
+                ("\n..." if len(conflicts) > 15 else "") +
+                "\n\nYes: revert them anyway (those later edits are lost).\n"
+                "No: revert everything else and leave these as they are.",
+                wx.YES_NO | wx.CANCEL | wx.ICON_WARNING)
+            if answer == wx.CANCEL:
+                return
+            force = answer == wx.YES
         busy = wx.BusyCursor()
         try:
-            res = portability.revert(self.project_dir)
+            res = portability.revert(self.project_dir, force=force)
         except Exception as exc:
             del busy
             self._msg("Revert failed:\n{}".format(exc), wx.OK | wx.ICON_ERROR)

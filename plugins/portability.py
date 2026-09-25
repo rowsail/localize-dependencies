@@ -5,14 +5,17 @@
 # symbols. Operates directly on the saved project files via the generic S-expr
 # parser (sexpr.py), editing only the exact byte spans it targets.
 #
-# SAFETY: every run backs up each file before modifying it and records a
-# manifest (.portability/manifest.json). revert() restores those files
-# byte-for-byte and removes anything the run created. Nothing is destructive
-# without a recorded undo.
+# SAFETY: before any file is modified it is backed up once, and the manifest
+# (.portability/manifest.json) is updated after every change, across all runs.
+# Writes are atomic and existing files are never overwritten by copies.
+# revert() restores the pre-localize state byte-for-byte, removes everything
+# the runs created, and leaves alone files edited since (unless forced).
 #
 # License: GPL-3.0-or-later
 
+import filecmp
 import glob
+import hashlib
 import json
 import os
 import re
@@ -99,8 +102,7 @@ def parse_lib_table(path):
     out = {}
     if not os.path.isfile(path):
         return out
-    with open(path, "r", encoding="utf-8") as fh:
-        root = sexpr.parse(fh.read())
+    root = sexpr.parse(_read(path))
     for lib in root.find_all("lib"):
         name = lib.find("name")
         uri = lib.find("uri")
@@ -152,11 +154,11 @@ def add_lib_entries(session, kind, entries):
     lines = "\n".join(_lib_entry(n, u) for n, u in sorted(new.items()))
 
     if os.path.isfile(path):
-        with open(path, "r", encoding="utf-8") as fh:
-            text = fh.read()
+        text = _read(path)
         root = sexpr.parse(text)
         close = root.end - 1                      # offset of final ')'
-        new_text = text[:close] + lines + "\n" + text[close:]
+        nl = "\r\n" if "\r\n" in text else "\n"   # match the file's line endings
+        new_text = text[:close] + lines.replace("\n", nl) + nl + text[close:]
         write_validated(session, path, new_text)
     else:
         new_text = "({}\n\t(version 7)\n{}\n)\n".format(_table_header(kind), lines)
@@ -178,87 +180,171 @@ def classify(raw, project_dir):
 
 # --- backup / manifest / revert ---------------------------------------------
 
+def _sha256(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as fh:
+        for chunk in iter(lambda: fh.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _read(path):
+    """Read a KiCad text file exactly: no newline translation, so CRLF files
+    are written back as CRLF."""
+    with open(path, "r", encoding="utf-8", newline="") as fh:
+        return fh.read()
+
+
 class Session:
-    """Tracks a localize run for safe, exact revert."""
+    """Tracks localize runs for safe, exact revert.
+
+    The manifest accumulates across runs: a file is backed up only the first
+    time any run touches it, so Revert always returns to the state before the
+    first localize. The manifest is rewritten after every change, so a run that
+    fails part-way can still be reverted."""
 
     def __init__(self, project_dir):
         self.project_dir = os.path.abspath(project_dir)
         self.state_dir = os.path.join(self.project_dir, STATE_DIRNAME)
-        self._backed = {}      # abs original path -> backup rel path
+        self._backed = {}      # rel original path -> backup rel path
         self._created_files = []
         self._created_dirs = []
+        self._hashes = {}      # rel path -> sha256 after our last write
+        self.summary = {}
+        man = _load_manifest(self.project_dir)
+        if man:
+            for e in man.get("backed_up", []):
+                self._backed[e["path"]] = e["backup"]
+            self._created_files = list(man.get("created_files", []))
+            self._created_dirs = list(man.get("created_dirs", []))
+            self._hashes = dict(man.get("hashes", {}))
+            self.summary = man.get("summary", {})
 
     def _rel(self, path):
-        return os.path.relpath(path, self.project_dir).replace(os.sep, "/")
+        return os.path.relpath(os.path.abspath(path),
+                               self.project_dir).replace(os.sep, "/")
 
     def backup(self, path):
         """Copy `path` into the backup store once, before it is modified."""
-        path = os.path.abspath(path)
-        if path in self._backed or not os.path.isfile(path):
-            return
         rel = self._rel(path)
+        if (rel in self._backed or rel in self._created_files
+                or not os.path.isfile(path)):
+            return
         dest = os.path.join(self.state_dir, "backup", rel)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
         shutil.copy2(path, dest)
-        self._backed[path] = os.path.join("backup", rel).replace(os.sep, "/")
+        self._backed[rel] = "backup/" + rel
+        self._save()
 
     def mkdir(self, path):
-        path = os.path.abspath(path)
-        if not os.path.isdir(path):
+        missing = []   # every level makedirs will create, so Revert removes all
+        p = os.path.abspath(path)
+        while not os.path.isdir(p):
+            missing.append(self._rel(p))
+            p = os.path.dirname(p)
+        if missing:
             os.makedirs(path, exist_ok=True)
-            self._created_dirs.append(self._rel(path))
+            self._created_dirs.extend(missing)
+            self._save()
 
     def wrote_new_file(self, path):
-        self._created_files.append(self._rel(os.path.abspath(path)))
+        """Record `path` as created by us. Call BEFORE writing it, so a write
+        that dies half-way still gets cleaned up by Revert."""
+        rel = self._rel(path)
+        if rel not in self._created_files:
+            self._created_files.append(rel)
+            self._save()
 
-    def save_manifest(self, summary):
+    def written(self, path):
+        """Record the content we left in `path`, so Revert can tell whether
+        the user changed it afterwards."""
+        self._hashes[self._rel(path)] = _sha256(path)
+        self._save()
+
+    def _save(self):
         os.makedirs(self.state_dir, exist_ok=True)
         manifest = {
-            "backed_up": [{"path": self._rel(p), "backup": b}
-                          for p, b in self._backed.items()],
+            "backed_up": [{"path": p, "backup": b} for p, b in self._backed.items()],
             "created_files": self._created_files,
             "created_dirs": self._created_dirs,
-            "summary": summary,
+            "hashes": self._hashes,
+            "summary": self.summary,
         }
-        with open(os.path.join(self.state_dir, MANIFEST_NAME), "w",
-                  encoding="utf-8") as fh:
+        mpath = os.path.join(self.state_dir, MANIFEST_NAME)
+        with open(mpath + ".tmp", "w", encoding="utf-8") as fh:
             json.dump(manifest, fh, indent=2)
+        os.replace(mpath + ".tmp", mpath)
+
+    def save_manifest(self, summary):
+        self.summary = summary
+        self._save()
+
+
+def _load_manifest(project_dir):
+    mpath = os.path.join(project_dir, STATE_DIRNAME, MANIFEST_NAME)
+    if not os.path.isfile(mpath):
+        return None
+    with open(mpath, "r", encoding="utf-8") as fh:
+        return json.load(fh)
 
 
 def has_backup(project_dir):
     return os.path.isfile(os.path.join(project_dir, STATE_DIRNAME, MANIFEST_NAME))
 
 
-def revert(project_dir):
+def revert_conflicts(project_dir):
+    """Files changed since we last wrote them (edited by the user, or by KiCad
+    saving over them). Revert would discard those edits."""
+    man = _load_manifest(os.path.abspath(project_dir)) or {}
+    out = []
+    for rel, sha in sorted(man.get("hashes", {}).items()):
+        p = os.path.join(project_dir, rel)
+        if os.path.isfile(p) and _sha256(p) != sha:
+            out.append(rel)
+    return out
+
+
+def revert(project_dir, force=False):
     """Restore backed-up files byte-for-byte and remove created files/dirs.
-    Returns a summary dict."""
+    Files changed since localize (see revert_conflicts) are left alone and
+    reported unless `force`. Returns a summary dict."""
     project_dir = os.path.abspath(project_dir)
     state_dir = os.path.join(project_dir, STATE_DIRNAME)
-    mpath = os.path.join(state_dir, MANIFEST_NAME)
-    if not os.path.isfile(mpath):
+    man = _load_manifest(project_dir)
+    if man is None:
         return {"restored": 0, "removed": 0, "errors": ["No portability backup found."]}
-    with open(mpath, "r", encoding="utf-8") as fh:
-        man = json.load(fh)
 
     restored = removed = 0
     errors = []
+    skip = set() if force else set(revert_conflicts(project_dir))
+    for rel in sorted(skip):
+        errors.append("skipped {}: changed since localize".format(rel))
 
+    kept_backed, kept_created = [], []   # still pending after this revert
     for entry in man.get("backed_up", []):
+        if entry["path"] in skip:
+            kept_backed.append(entry)
+            continue
         src = os.path.join(state_dir, entry["backup"])
         dst = os.path.join(project_dir, entry["path"])
         try:
             shutil.copy2(src, dst)
             restored += 1
         except OSError as exc:
+            kept_backed.append(entry)
             errors.append("restore {}: {}".format(entry["path"], exc))
 
     for rel in man.get("created_files", []):
+        if rel in skip:
+            kept_created.append(rel)
+            continue
         p = os.path.join(project_dir, rel)
         try:
             if os.path.isfile(p):
                 os.remove(p)
                 removed += 1
         except OSError as exc:
+            kept_created.append(rel)
             errors.append("remove {}: {}".format(rel, exc))
 
     # deepest dirs first so they are empty when removed
@@ -270,9 +356,18 @@ def revert(project_dir):
         except OSError:
             pass
 
-    # finally drop the state dir if the manifest restore fully succeeded
-    if not errors:
+    if not kept_backed and not kept_created:
         shutil.rmtree(state_dir, ignore_errors=True)
+    else:
+        # keep only what is still pending, so a later (forced) Revert can
+        # finish the job without re-flagging files we already restored
+        kept = {e["path"] for e in kept_backed} | set(kept_created)
+        man["backed_up"] = kept_backed
+        man["created_files"] = kept_created
+        man["hashes"] = {p: h for p, h in man.get("hashes", {}).items() if p in kept}
+        mpath = os.path.join(state_dir, MANIFEST_NAME)
+        with open(mpath, "w", encoding="utf-8") as fh:
+            json.dump(man, fh, indent=2)
 
     return {"restored": restored, "removed": removed, "errors": errors}
 
@@ -281,14 +376,18 @@ def revert(project_dir):
 
 def write_validated(session, path, new_text, is_new=False):
     """Write new_text to path, but only after confirming it re-parses. Backs up
-    an existing file first. Raises on parse failure (leaving the original)."""
+    an existing file first. Raises on parse failure (leaving the original).
+    The write is atomic: a crash leaves either the old or the new file."""
     sexpr.parse(new_text)  # will raise SExprError if we produced garbage
     if is_new:
         session.wrote_new_file(path)
     else:
         session.backup(path)
-    with open(path, "w", encoding="utf-8", newline="") as fh:
+    tmp = path + ".portability-tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
         fh.write(new_text)
+    os.replace(tmp, path)
+    session.written(path)
 
 
 def _prop(node, name):
@@ -319,7 +418,7 @@ def scan_items(project_dir, include_standard=False):
 
     for sch in sorted(glob.glob(os.path.join(project_dir, "*.kicad_sch"))):
         rel = os.path.relpath(sch, project_dir).replace(os.sep, "/")
-        root = sexpr.parse(open(sch, encoding="utf-8").read())
+        root = sexpr.parse(_read(sch))
         for i, sym in enumerate(_symbol_instances(root)):
             lid = sym.find("lib_id")
             if not (lid and lid.children[1:]):
@@ -335,7 +434,7 @@ def scan_items(project_dir, include_standard=False):
 
     for pcb in sorted(glob.glob(os.path.join(project_dir, "*.kicad_pcb"))):
         rel = os.path.relpath(pcb, project_dir).replace(os.sep, "/")
-        root = sexpr.parse(open(pcb, encoding="utf-8").read())
+        root = sexpr.parse(_read(pcb))
         for fi, fp in enumerate(root.find_all("footprint")):
             if not (fp.children[1:] and fp.children[1].kind == "atom"):
                 continue
@@ -363,20 +462,8 @@ def scan_items(project_dir, include_standard=False):
 
 # --- 3D model localization ---------------------------------------------------
 
-def _dest_for_model(resolved, project_dir):
-    """(abs_dest, kiprjmod_relpath) preserving the *.3dshapes subfolder."""
-    fname = os.path.basename(resolved)
-    subdir = os.path.basename(os.path.dirname(resolved))
-    parts = [LOCAL_3D_DIRNAME] + ([subdir] if subdir else []) + [fname]
-    abs_dest = os.path.join(project_dir, *parts)
-    rel = "/".join(parts)
-    return abs_dest, "${KIPRJMOD}/" + rel
-
-
-def _copy_with_twins(session, resolved, abs_dest):
-    dest_dir = os.path.dirname(abs_dest)
-    session.mkdir(dest_dir)
-    copied = 0
+def _model_sources(resolved):
+    """The model file plus its same-stem twins (.step/.wrl/...), one per name."""
     stem = os.path.splitext(os.path.basename(resolved))[0]
     src_dir = os.path.dirname(resolved)
     todo = [resolved]
@@ -385,20 +472,54 @@ def _copy_with_twins(session, resolved, abs_dest):
             t = os.path.join(src_dir, stem + e)
             if os.path.isfile(t) and t != resolved:
                 todo.append(t)
-    seen = set()
+    out, seen = [], set()
     for src in todo:
-        base = os.path.basename(src)
-        key = base.lower()
-        if key in seen:
-            continue
-        seen.add(key)
-        dst = os.path.join(dest_dir, base)
+        if os.path.basename(src).lower() not in seen:
+            seen.add(os.path.basename(src).lower())
+            out.append(src)
+    return out
+
+
+def _place_model(session, resolved):
+    """Copy a model (and its twins) into packages3D/<*.3dshapes>/ and return
+    (kiprjmod_path, files_copied).
+
+    Never overwrites: a destination that already holds identical content is
+    reused, and one holding different content (the user's own file, or a
+    same-named model from another library) gets a _1, _2, ... suffix instead."""
+    project_dir = session.project_dir
+    subdir = os.path.basename(os.path.dirname(resolved))
+    parts = [LOCAL_3D_DIRNAME] + ([subdir] if subdir else [])
+    dest_dir = os.path.join(project_dir, *parts)
+    stem, ext = os.path.splitext(os.path.basename(resolved))
+    srcs = _model_sources(resolved)
+
+    def dst_for(src, s):
+        return os.path.join(dest_dir, s + os.path.splitext(src)[1])
+
+    def fits(s):
+        return all(not os.path.exists(dst_for(src, s))
+                   or filecmp.cmp(src, dst_for(src, s), shallow=False)
+                   for src in srcs)
+
+    n, new_stem = 0, stem
+    while not fits(new_stem):
+        n += 1
+        new_stem = "{}_{}".format(stem, n)
+
+    session.mkdir(dest_dir)
+    copied = 0
+    for src in srcs:
+        dst = dst_for(src, new_stem)
         if os.path.normcase(os.path.abspath(src)) == os.path.normcase(os.path.abspath(dst)):
             continue
-        shutil.copy2(src, dst)
+        if os.path.exists(dst):   # identical content, reuse it
+            continue
         session.wrote_new_file(dst)
+        shutil.copy2(src, dst)
+        session.written(dst)
         copied += 1
-    return copied
+    return "${KIPRJMOD}/" + "/".join(parts + [new_stem + ext]), copied
 
 
 def localize_models(session, rows):
@@ -416,10 +537,10 @@ def localize_models(session, rows):
         by_pcb.setdefault(k[1], set()).add(k)
 
     files_copied = remapped = 0
-    copied_sources = set()
+    placed = {}   # normcased source -> new ${KIPRJMOD} path
     for rel, kset in by_pcb.items():
         pcb = os.path.join(project_dir, rel)
-        text = open(pcb, encoding="utf-8").read()
+        text = _read(pcb)
         root = sexpr.parse(text)
         editor = sexpr.Editor(text)
         for fi, fp in enumerate(root.find_all("footprint")):
@@ -428,17 +549,16 @@ def localize_models(session, rows):
                     continue
                 atom = model.children[1]
                 resolved = resolve(atom.value)
-                abs_dest, new_raw = _dest_for_model(resolved, project_dir)
                 src_key = os.path.normcase(os.path.abspath(resolved))
-                if src_key not in copied_sources:
-                    files_copied += _copy_with_twins(session, resolved, abs_dest)
-                    copied_sources.add(src_key)
-                editor.replace_atom(atom, new_raw, force_quote=True)
+                if src_key not in placed:
+                    placed[src_key], n = _place_model(session, resolved)
+                    files_copied += n
+                editor.replace_atom(atom, placed[src_key], force_quote=True)
                 remapped += 1
         write_validated(session, pcb, editor.result())
 
     return {"files_copied": files_copied, "remapped": remapped,
-            "unique_sources": len(copied_sources)}
+            "unique_sources": len(placed)}
 
 
 # --- footprint / symbol library localization ---------------------------------
@@ -486,7 +606,7 @@ def localize_footprints(session, rows):
     copied = remapped = 0
     for rel, kset in by_pcb.items():
         pcb = os.path.join(project_dir, rel)
-        text = open(pcb, encoding="utf-8").read()
+        text = _read(pcb)
         root = sexpr.parse(text)
         editor = sexpr.Editor(text)
         for fi, fp in enumerate(root.find_all("footprint")):
@@ -506,8 +626,9 @@ def localize_footprints(session, rows):
             src_file = os.path.join(src_dir_cache[nick], name + ".kicad_mod")
             dst_file = os.path.join(local_dir, name + ".kicad_mod")
             if os.path.isfile(src_file) and not os.path.isfile(dst_file):
-                shutil.copy2(src_file, dst_file)
                 session.wrote_new_file(dst_file)
+                shutil.copy2(src_file, dst_file)
+                session.written(dst_file)
                 copied += 1
             editor.replace_atom(atom, "{}:{}".format(local_nick, name), force_quote=True)
             entries[local_nick] = "${{KIPRJMOD}}/{}/{}{}".format(
@@ -553,15 +674,16 @@ def localize_symbols(session, rows):
         local_lib = os.path.join(project_dir, LOCAL_LIB_DIRNAME, local_nick + ".kicad_sym")
         session.mkdir(os.path.dirname(local_lib))
         if os.path.isfile(sfile) and not os.path.isfile(local_lib):
-            shutil.copy2(sfile, local_lib)
             session.wrote_new_file(local_lib)
+            shutil.copy2(sfile, local_lib)
+            session.written(local_lib)
             copied += 1
         entries[local_nick] = "${{KIPRJMOD}}/{}/{}.kicad_sym".format(
             LOCAL_LIB_DIRNAME, local_nick)
 
     remapped = 0
     for sch in glob.glob(os.path.join(project_dir, "*.kicad_sch")):
-        text = open(sch, encoding="utf-8").read()
+        text = _read(sch)
         root = sexpr.parse(text)
         editor = sexpr.Editor(text)
         touched = False

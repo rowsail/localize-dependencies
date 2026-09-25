@@ -86,10 +86,13 @@ install it, and restart the PCB editor.
 ## Safety
 
 Nothing changes until you click Localize, and whatever it changes is copied into
-`.portability/` first. Revert puts every modified file back as it was and removes
-the local copies. Since it works on files on disk, get in the habit of saving
-before you run it and reloading after, and keep important projects under version
-control.
+`.portability/` first. Revert puts every modified file back as it was before the
+first Localize and removes the local copies, however many times you ran it, and
+also after a run that failed part-way. Copies never overwrite an existing file:
+a 3D model that clashes with one already in `packages3D/` gets a `_1` suffix.
+If you edited a file after localizing, Revert asks before throwing that edit
+away. Since it works on files on disk, get in the habit of saving before you run
+it and reloading after, and keep important projects under version control.
 
 ## Building the package
 

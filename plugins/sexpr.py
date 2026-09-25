@@ -83,7 +83,8 @@ def parse(text):
     """Parse S-expr text into a single root Node. Raises SExprError on malformed
     input. Guarantees full consumption of the input."""
     n = len(text)
-    i = 0
+    # a UTF-8 BOM stays in the text (so edits keep it) but is not content
+    i = 1 if text.startswith("﻿") else 0
     # skip leading whitespace
     while i < n and text[i] in WHITESPACE:
         i += 1
