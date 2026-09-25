@@ -45,11 +45,18 @@ _INSTALL_GLOBS = (
 
 # --- path resolution ---------------------------------------------------------
 
+def _version_key(path):
+    """Sort key: newest KiCad version first. A plain string sort ranks "9.0"
+    and "6.0" above "10.0", which picks an old install's libraries."""
+    m = re.search(r"(\d+)\.(\d+)", path)
+    return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
+
+
 def _install_share():
     hits = []
     for pat in _INSTALL_GLOBS:
         hits.extend(p for p in glob.glob(pat) if os.path.isdir(p))
-    hits.sort(reverse=True)
+    hits.sort(key=_version_key, reverse=True)
     return hits[0] if hits else None
 
 
@@ -114,8 +121,8 @@ def parse_lib_table(path):
 def _config_dirs():
     base = os.path.expandvars(r"%APPDATA%\kicad") if os.name == "nt" else \
         os.path.expanduser("~/.config/kicad")
-    return sorted(glob.glob(os.path.join(base, "*")), reverse=True) \
-        if os.path.isdir(base) else []
+    return sorted(glob.glob(os.path.join(base, "*")), key=_version_key,
+                  reverse=True) if os.path.isdir(base) else []
 
 
 def resolve_lib_uri(project_dir, table_name, nickname):
