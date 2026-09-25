@@ -94,6 +94,22 @@ If you edited a file after localizing, Revert asks before throwing that edit
 away. Since it works on files on disk, get in the habit of saving before you run
 it and reloading after, and keep important projects under version control.
 
+## Testing
+
+Each test file runs on its own with `python tests/<file>.py`:
+
+- `test_safety.py` and `test_versions.py`: the engine, pure Python.
+- `test_dialog.py`: the dialog's prompts. Needs wx and kipy, for example the
+  plugin's own KiCad venv.
+- `test_kicad_projects.py`: localizes KiCad's demo projects, then checks with
+  `kicad-cli` that DRC, ERC and the STEP export give the same results with no
+  global libraries configured, and that Revert restores every file exactly.
+  Needs a KiCad install; set `KICAD_CLI` to test a specific one.
+
+KiCad runs the installed copy of the plugin, not this checkout. Run
+`python tools/install_dev.py` to copy `plugins/` there before trying a change
+in KiCad. CI runs all of the above on every push.
+
 ## Building the package
 
 Run `python build.py`. It produces `dist/localize-dependencies-<version>.zip` in

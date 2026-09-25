@@ -1,0 +1,54 @@
+name: Tests
+
+on:
+  push:
+  pull_request:
+    branches: [main]
+
+jobs:
+  unit:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Install wxPython runtime dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y xvfb libnotify4 libsdl2-2.0-0 libsm6
+
+      - name: Install plugin dependencies
+        run: |
+          pip install wxPython==4.2.2 \
+            -f https://extras.wxpython.org/wxPython4/extras/linux/gtk3/ubuntu-24.04/
+          pip install -r plugins/requirements.txt
+
+      - name: Run engine and dialog tests
+        run: |
+          python tests/test_safety.py
+          python tests/test_versions.py
+          xvfb-run -a python tests/test_dialog.py
+
+  # Localizes KiCad's own demo projects and has kicad-cli judge the result.
+  # No 3D model package: it is several GB, so models show as missing both
+  # before and after and only symbols and footprints are exercised here.
+  kicad:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install KiCad 10
+        run: |
+          sudo add-apt-repository -y ppa:kicad/kicad-10.0-releases
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            kicad kicad-demos kicad-symbols kicad-footprints kicad-templates
+          kicad-cli version
+
+      - name: Run end-to-end tests on the demo projects
+        env:
+          REQUIRE_KICAD: "1"
+        run: python3 tests/test_kicad_projects.py
