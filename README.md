@@ -102,6 +102,16 @@ Editing Options*, "flip left/right"); with left/right, the result is turned
 180° as a whole, 3D model included, which recovers the footprint a left/right
 flip was made from (KiCad's own export loses that turn).
 
+### STEP instead of VRML
+
+A `.wrl` model is a mesh: KiCad's 3D viewer shows it, but a STEP export
+leaves the part out ("Cannot use VRML models when exporting to non-mesh
+formats") unless you ask it to substitute models. *Use STEP instead of VRML*
+points every `.wrl` model that has a `.step`/`.stp` of the same name beside it
+at that file, on the boards and in the project's own footprint libraries.
+The `.wrl` files are not deleted; Revert undoes the change. Paths using
+KiCad's own path variables (*Preferences > Configure Paths*) are resolved.
+
 ### Embedded 3D models
 
 KiCad 9 and later can embed a 3D model in the board file itself
@@ -134,6 +144,7 @@ Each test file runs on its own with `python tests/<file>.py`:
 - `test_safety.py` and `test_versions.py`: the engine, pure Python.
 - `test_embedded.py`: embedded 3D models. Needs `zstandard` or the `zstd` tool.
 - `test_symbols.py`: symbol libraries, single-file and folder (`.kicad_symdir`).
+- `test_step.py`: "Use STEP instead of VRML", and KiCad path variables.
 - `test_footprints.py`: footprint localization updates the schematic's
   Footprint fields too, including symbols shared by reused sheets, and
   footprints are rebuilt from the board when their library is gone.

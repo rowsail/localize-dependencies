@@ -114,6 +114,11 @@ class LocalizeDialog(wx.Dialog):
         btn_mod = wx.Button(self, label="All 3D models")
         btn_emb = wx.Button(self, label="Embedded 3D models")
         self.btn_run = wx.Button(self, label="Localize")
+        self.btn_step = wx.Button(self, label="Use STEP instead of VRML")
+        self.btn_step.SetToolTip(
+            "Point .wrl models at the .step/.stp of the same name beside them, so "
+            "STEP exports include those parts. Boards and project footprints; "
+            "Revert restores them.")
         self.btn_unused = wx.Button(self, label="Remove unused embedded")
         self.btn_unused.SetToolTip(
             "Delete embedded 3D models that no footprint references "
@@ -129,11 +134,13 @@ class LocalizeDialog(wx.Dialog):
         self.btn_run.Bind(wx.EVT_BUTTON, self.on_run)
         self.btn_revert.Bind(wx.EVT_BUTTON, self.on_revert)
         self.btn_unused.Bind(wx.EVT_BUTTON, self.on_remove_unused)
+        self.btn_step.Bind(wx.EVT_BUTTON, self.on_use_step)
 
         left = wx.BoxSizer(wx.HORIZONTAL)
         for b in (btn_all, btn_none, btn_sym, btn_fp, btn_mod, btn_emb):
             left.Add(b, 0, wx.RIGHT, 6)
         right = wx.BoxSizer(wx.HORIZONTAL)
+        right.Add(self.btn_step, 0, wx.RIGHT, 8)
         right.Add(self.btn_unused, 0, wx.RIGHT, 8)
         right.Add(self.btn_run, 0, wx.RIGHT, 8)
         right.Add(self.btn_revert, 0, wx.RIGHT, 8)
@@ -155,8 +162,9 @@ class LocalizeDialog(wx.Dialog):
         self.populate()
         self.btn_revert.Enable(portability.has_backup(project_dir))
         self._update_unused()
-        self.SetSize((1240, 560))
-        self.SetMinSize((1160, 400))
+        self._update_step()
+        self.SetSize((1420, 560))
+        self.SetMinSize((1340, 400))
 
     # --- population / sorting ---
 
@@ -377,6 +385,58 @@ class LocalizeDialog(wx.Dialog):
         self.btn_unused.Enable(bool(n))
         self.Layout()
 
+    def _update_step(self):
+        try:
+            self.vrml = portability.scan_vrml_models(self.project_dir)
+        except Exception:
+            self.vrml = []
+        n = len(self.vrml)
+        self.btn_step.SetLabel("Use STEP instead of VRML ({})".format(n) if n
+                               else "Use STEP instead of VRML")
+        self.btn_step.Enable(bool(n))
+        self.Layout()
+
+    def on_use_step(self, _evt):
+        if not self.vrml:
+            return
+        pairs = sorted({(v["model"].rsplit("/", 1)[-1], v["step"].rsplit("/", 1)[-1])
+                        for v in self.vrml})
+        shown = "\n".join("  {} -> {}".format(a, b) for a, b in pairs[:15])
+        if len(pairs) > 15:
+            shown += "\n  ... and {} more".format(len(pairs) - 15)
+        files = len({v["file"] for v in self.vrml})
+        if self._msg(
+            "Point {} VRML model reference(s) in {} file(s) at the STEP model of "
+            "the same name?\n\n{}\n\n"
+            "A STEP export leaves VRML-only parts out. The .wrl files are not "
+            "deleted.\n\n"
+            "1. Save the project in KiCad first (Ctrl+S).\n"
+            "2. Every changed file is backed up first; Revert restores it.\n"
+            "3. Afterwards, close the PCB editor WITHOUT saving and reopen it.\n\n"
+            "Continue?".format(len(self.vrml), files, shown),
+            wx.YES_NO | wx.ICON_QUESTION,
+        ) != wx.YES:
+            return
+        busy = wx.BusyCursor()
+        try:
+            session = portability.Session(self.project_dir)
+            res = portability.use_step_models(session)
+            session.save_manifest({"step_models": res})
+        except Exception as exc:
+            del busy
+            self.refresh()
+            self._msg("Changing models failed part-way:\n{}\n\n"
+                      "Every change made before the error is recorded. "
+                      "Click Revert to undo them.".format(exc),
+                      wx.OK | wx.ICON_ERROR)
+            return
+        del busy
+        self.refresh()
+        self._msg("{} model reference(s) in {} file(s) now use STEP.\n\n"
+                  "Close the PCB editor without saving, then reopen the project."
+                  .format(res["references"], res["files"]),
+                  wx.OK | wx.ICON_INFORMATION)
+
     def on_remove_unused(self, _evt):
         if not self.unused:
             return
@@ -466,6 +526,7 @@ class LocalizeDialog(wx.Dialog):
         self.populate()
         self.btn_revert.Enable(portability.has_backup(self.project_dir))
         self._update_unused()
+        self._update_step()
         del busy
 
 

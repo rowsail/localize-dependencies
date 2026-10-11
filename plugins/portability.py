@@ -64,12 +64,30 @@ def _install_share():
     return hits[0] if hits else None
 
 
+def kicad_path_vars():
+    """The user's path variables from KiCad's settings (Preferences >
+    Configure Paths: kicad_common.json environment.vars), newest config
+    first; {} if none. The plugin may run without them in its environment."""
+    for d in _config_dirs():
+        path = os.path.join(d, "kicad_common.json")
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    found = json.load(fh).get("environment", {}).get("vars") or {}
+                return {k: v for k, v in found.items() if isinstance(v, str) and v}
+            except (OSError, ValueError):
+                return {}
+    return {}
+
+
 def make_resolver(project_dir):
     """Return resolve(raw)->absolute path, expanding ${KIPRJMOD}, KiCad library
-    dir vars, and any environment variables. Falls back to the KiCad install
-    share dir for unset ${KICAD*_{3DMODEL,FOOTPRINT,SYMBOL}_DIR} (common: the
-    plugin runs in a separate process without those set)."""
+    dir vars, and any environment variables, then the user's KiCad path
+    variables (kicad_path_vars). Falls back to the KiCad install share dir for
+    unset ${KICAD*_{3DMODEL,FOOTPRINT,SYMBOL}_DIR} (common: the plugin runs in
+    a separate process without those set)."""
     share = _install_share()
+    kicad_vars = kicad_path_vars()
     env_model = {v: os.environ[v] for v in _MODEL_DIR_VARS
                  if os.environ.get(v) and os.path.isdir(os.environ[v])}
     fallbacks = {}   # var-suffix -> dir
@@ -92,7 +110,7 @@ def make_resolver(project_dir):
                 return project_dir
             if name in env_model:
                 return env_model[name]
-            val = os.environ.get(name)
+            val = os.environ.get(name) or kicad_vars.get(name)
             if val:
                 return val
             for suffix, d in fallbacks.items():
@@ -863,6 +881,93 @@ def remove_unused_embedded(session):
 
 
 # --- footprint / symbol library localization ---------------------------------
+
+# --- STEP instead of VRML ----------------------------------------------------
+#
+# A .wrl (VRML) model is a mesh: the 3D viewer shows it, but a STEP export
+# leaves the part out ("Cannot use VRML models when exporting to non-mesh
+# formats") unless --subst-models is given. When a .step/.stp of the same
+# name sits beside it, point the model at that instead.
+
+_STEP_EXTS = (".step", ".stp", ".STEP", ".STP")
+
+
+def _step_twin(raw, resolve, embed_names):
+    """The STEP twin of a .wrl model path (same folder, same name), as the
+    path to write, or None. Works for kicad-embed:// models too."""
+    if raw.startswith(EMBED_PREFIX):
+        name = raw[len(EMBED_PREFIX):]
+        if name.lower().endswith(".wrl"):
+            for ext in _STEP_EXTS:
+                if name[:-4] + ext in embed_names:
+                    return EMBED_PREFIX + name[:-4] + ext
+        return None
+    if not raw.lower().endswith(".wrl"):
+        return None
+    resolved = resolve(raw)
+    for ext in _STEP_EXTS:
+        if os.path.isfile(resolved[:-4] + ext):
+            return raw[:-4] + ext
+    return None
+
+
+def _model_holders(project_dir):
+    """Files whose (model ...) paths the project controls: its boards and the
+    footprints of its project-local (${KIPRJMOD}) footprint libraries."""
+    out = sorted(glob.glob(os.path.join(project_dir, "*.kicad_pcb")))
+    resolve = make_resolver(project_dir)
+    table = parse_lib_table(os.path.join(project_dir, "fp-lib-table"))
+    for uri in sorted(set(table.values())):
+        if "${KIPRJMOD}" in uri:
+            out += sorted(glob.glob(os.path.join(resolve(uri), "*.kicad_mod")))
+    return out
+
+
+def _vrml_swaps(project_dir, path, text, root):
+    """[(model atom, new path)] for one board or footprint file."""
+    resolve = make_resolver(project_dir)
+    fps = root.find_all("footprint") if root.head() == "kicad_pcb" else [root]
+    board = _embedded_names(root) if root.head() == "kicad_pcb" else set()
+    out = []
+    for fp in fps:
+        names = board | _embedded_names(fp)
+        for m in fp.find_all("model"):
+            if m.children[1:] and m.children[1].kind == "atom":
+                new = _step_twin(m.children[1].value, resolve, names)
+                if new:
+                    out.append((m.children[1], new))
+    return out
+
+
+def scan_vrml_models(project_dir):
+    """Read-only: [{'file', 'model', 'step'}] for every .wrl model reference
+    in the project's boards and local footprints that has a STEP twin."""
+    rows = []
+    for path in _model_holders(project_dir):
+        text = _read(path)
+        for atom, new in _vrml_swaps(project_dir, path, text, sexpr.parse(text)):
+            rows.append({"file": os.path.relpath(path, project_dir).replace(os.sep, "/"),
+                         "model": atom.value, "step": new})
+    return rows
+
+
+def use_step_models(session):
+    """Point every .wrl model reference that has a STEP twin at the STEP file,
+    in the boards and the project-local footprints, backing each file up."""
+    refs = files = 0
+    for path in _model_holders(session.project_dir):
+        text = _read(path)
+        swaps = _vrml_swaps(session.project_dir, path, text, sexpr.parse(text))
+        if not swaps:
+            continue
+        editor = sexpr.Editor(text)
+        for atom, new in swaps:
+            editor.replace_atom(atom, new, force_quote=True)
+        write_validated(session, path, editor.result())
+        refs += len(swaps)
+        files += 1
+    return {"references": refs, "files": files}
+
 
 LOCAL_LIB_DIRNAME = "libs"
 LOCAL_SUFFIX = "_local"

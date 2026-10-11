@@ -142,6 +142,22 @@ def test_remove_unused_embedded_button():
         shutil.rmtree(root)
 
 
+def test_use_step_button():
+    import test_step
+    root, proj, _ = test_step._project()
+    try:
+        dlg = _dialog(proj, [wx.YES])
+        assert dlg.btn_step.IsEnabled() and dlg.btn_step.GetLabel().endswith("(4)")
+        dlg.on_use_step(None)
+        assert "R.wrl -> R.step" in dlg.shown[0]
+        assert portability.scan_vrml_models(proj) == []
+        assert not dlg.btn_step.IsEnabled()
+        assert "4 model reference(s) in 2 file(s)" in dlg.shown[-1]
+        dlg.Destroy()
+    finally:
+        shutil.rmtree(root)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
