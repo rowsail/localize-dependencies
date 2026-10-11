@@ -169,6 +169,50 @@ def test_crlf_board_survives_extraction():
         shutil.rmtree(root)
 
 
+def test_remove_unused_keeps_used_and_non_models():
+    root, proj = _project()
+    try:
+        pcb = os.path.join(proj, "board.kicad_pcb")
+        original = _bytes(pcb)
+        unused = portability.scan_unused_embedded(proj)
+        assert [u["name"] for u in unused] == ["M.wrl", "Orphan.step"], unused
+        s = portability.Session(proj)
+        res = portability.remove_unused_embedded(s)
+        s.save_manifest({"unused_embedded": res})
+        assert res["removed"] == 2 and res["boards"] == 1, res
+        assert res["bytes"] == len(original) - len(_bytes(pcb)) - 2 * 3, \
+            "bytes = the entries' text (plus the 2 newline+indent each)"
+        text = _board(proj)
+        root_node = sexpr.parse(text)
+        assert set(portability._embedded_files(root_node)) == {"M.step", "sheet.pdf"}, \
+            "used model and the datasheet stay"
+        assert portability.scan_unused_embedded(proj) == []
+        assert {r["ref"] for r in _rows(proj)} == {"R1", "R2", "U1"}, "still resolvable"
+        res = portability.revert(proj)
+        assert res["errors"] == [], res
+        assert _bytes(pcb) == original
+    finally:
+        shutil.rmtree(root)
+
+
+def test_remove_unused_after_extract_then_revert_both():
+    root, proj = _project()
+    try:
+        pcb = os.path.join(proj, "board.kicad_pcb")
+        original = _bytes(pcb)
+        _run(proj, _rows(proj))
+        s = portability.Session(proj)
+        s.save_manifest({"unused_embedded": portability.remove_unused_embedded(s)})
+        files = portability._embedded_files(sexpr.parse(_board(proj)))
+        assert set(files) == {"sheet.pdf"}, files
+        res = portability.revert(proj)
+        assert res["errors"] == [], res
+        assert _bytes(pcb) == original, "revert undoes both runs"
+        assert not os.path.exists(os.path.join(proj, "packages3D"))
+    finally:
+        shutil.rmtree(root)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

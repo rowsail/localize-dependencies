@@ -774,6 +774,68 @@ def localize_embedded_models(session, rows):
             "embeds_removed": removed}
 
 
+def _embed_refs(text):
+    """Every name referenced as kicad-embed://NAME anywhere in a file's text."""
+    return set(re.findall(r'kicad-embed://((?:[^"\\]|\\.)*)"', text))
+
+
+def _unused_in(text, root):
+    """[(block node, {name: file node} to drop, all files of the block)] for
+    the embedded 3D models nothing in `text` references. Only (type model)
+    entries are considered: fonts, datasheets and drawing sheets can be
+    referenced from outside the board file."""
+    refs = _embed_refs(text)
+    out = []
+    for owner in [root] + root.find_all("footprint"):
+        files = _embedded_files(owner)
+        drop = {}
+        for name, f in files.items():
+            ty = f.find("type")
+            if (ty is not None and ty.children[1:] and ty.children[1].value == "model"
+                    and name not in refs):
+                drop[name] = f
+        if drop:
+            out.append((owner.find("embedded_files"), drop, files))
+    return out
+
+
+def scan_unused_embedded(project_dir):
+    """Read-only: [{'pcb', 'name', 'bytes'}] for every embedded 3D model in the
+    project's boards that no kicad-embed:// reference uses. 'bytes' is the
+    board-file text the entry takes, i.e. what removing it saves."""
+    rows = []
+    for pcb in sorted(glob.glob(os.path.join(project_dir, "*.kicad_pcb"))):
+        rel = os.path.relpath(pcb, project_dir).replace(os.sep, "/")
+        text = _read(pcb)
+        for _blk, drop, _files in _unused_in(text, sexpr.parse(text)):
+            for name, f in drop.items():
+                rows.append({"pcb": rel, "name": name, "bytes": f.end - f.start})
+    return rows
+
+
+def remove_unused_embedded(session):
+    """Delete every embedded 3D model nothing references (see _unused_in),
+    backing each board up first. Returns {'removed', 'bytes', 'boards'}."""
+    removed = nbytes = boards = 0
+    for pcb in sorted(glob.glob(os.path.join(session.project_dir, "*.kicad_pcb"))):
+        text = _read(pcb)
+        found = _unused_in(text, sexpr.parse(text))
+        if not found:
+            continue
+        editor = sexpr.Editor(text)
+        for block, drop, files in found:
+            if len(drop) == len(files):
+                _delete_span(editor, text, block)
+            else:
+                for f in drop.values():
+                    _delete_span(editor, text, f)
+            removed += len(drop)
+            nbytes += sum(f.end - f.start for f in drop.values())
+        write_validated(session, pcb, editor.result())
+        boards += 1
+    return {"removed": removed, "bytes": nbytes, "boards": boards}
+
+
 # --- footprint / symbol library localization ---------------------------------
 
 LOCAL_LIB_DIRNAME = "libs"

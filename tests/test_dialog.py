@@ -115,6 +115,33 @@ def test_revert_cancel_touches_nothing():
         shutil.rmtree(root)
 
 
+def test_remove_unused_embedded_button():
+    import test_embedded
+    root, proj = test_embedded._project()
+    try:
+        pcb = os.path.join(proj, "board.kicad_pcb")
+        original = _bytes(pcb)
+        dlg = _dialog(proj, [wx.NO])
+        assert dlg.btn_unused.IsEnabled()
+        assert dlg.btn_unused.GetLabel().startswith("Remove unused embedded (2, ")
+        dlg.on_remove_unused(None)              # answered No: nothing changes
+        assert _bytes(pcb) == original
+        assert "Orphan.step" in dlg.shown[0] and "M.wrl" in dlg.shown[0]
+        dlg.Destroy()
+
+        dlg = _dialog(proj, [wx.YES])
+        dlg.on_remove_unused(None)
+        assert portability.scan_unused_embedded(proj) == []
+        assert not dlg.btn_unused.IsEnabled(), "nothing left to remove"
+        assert dlg.btn_revert.IsEnabled()
+        assert "Removed 2 unused embedded" in dlg.shown[-1]
+        dlg.Destroy()
+        assert portability.revert(proj)["errors"] == []
+        assert _bytes(pcb) == original
+    finally:
+        shutil.rmtree(root)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

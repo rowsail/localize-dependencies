@@ -112,6 +112,10 @@ class LocalizeDialog(wx.Dialog):
         btn_mod = wx.Button(self, label="All 3D models")
         btn_emb = wx.Button(self, label="Embedded 3D models")
         self.btn_run = wx.Button(self, label="Localize")
+        self.btn_unused = wx.Button(self, label="Remove unused embedded")
+        self.btn_unused.SetToolTip(
+            "Delete embedded 3D models that no footprint references "
+            "(left behind when footprints are replaced). Revert restores them.")
         self.btn_revert = wx.Button(self, label="Revert")
         btn_close = wx.Button(self, wx.ID_CANCEL, label="Close")
         btn_all.Bind(wx.EVT_BUTTON, lambda e: self._check_all(True))
@@ -122,11 +126,13 @@ class LocalizeDialog(wx.Dialog):
         btn_emb.Bind(wx.EVT_BUTTON, lambda e: self._check_type("model", "embedded"))
         self.btn_run.Bind(wx.EVT_BUTTON, self.on_run)
         self.btn_revert.Bind(wx.EVT_BUTTON, self.on_revert)
+        self.btn_unused.Bind(wx.EVT_BUTTON, self.on_remove_unused)
 
         left = wx.BoxSizer(wx.HORIZONTAL)
         for b in (btn_all, btn_none, btn_sym, btn_fp, btn_mod, btn_emb):
             left.Add(b, 0, wx.RIGHT, 6)
         right = wx.BoxSizer(wx.HORIZONTAL)
+        right.Add(self.btn_unused, 0, wx.RIGHT, 8)
         right.Add(self.btn_run, 0, wx.RIGHT, 8)
         right.Add(self.btn_revert, 0, wx.RIGHT, 8)
         right.Add(btn_close, 0)
@@ -146,8 +152,9 @@ class LocalizeDialog(wx.Dialog):
         self.apply_sort()
         self.populate()
         self.btn_revert.Enable(portability.has_backup(project_dir))
-        self.SetSize((1060, 560))
-        self.SetMinSize((980, 400))
+        self._update_unused()
+        self.SetSize((1240, 560))
+        self.SetMinSize((1160, 400))
 
     # --- population / sorting ---
 
@@ -346,6 +353,57 @@ class LocalizeDialog(wx.Dialog):
                   "without saving, then reopen the project.",
                   wx.OK | wx.ICON_INFORMATION)
 
+    def _update_unused(self):
+        try:
+            self.unused = portability.scan_unused_embedded(self.project_dir)
+        except Exception:
+            self.unused = []
+        n = len(self.unused)
+        mb = sum(u["bytes"] for u in self.unused) / 1e6
+        self.btn_unused.SetLabel("Remove unused embedded ({}, {:.1f} MB)".format(n, mb)
+                                 if n else "Remove unused embedded")
+        self.btn_unused.Enable(bool(n))
+        self.Layout()
+
+    def on_remove_unused(self, _evt):
+        if not self.unused:
+            return
+        names = sorted({u["name"] for u in self.unused}, key=str.lower)
+        shown = "\n".join("  " + n for n in names[:15])
+        if len(names) > 15:
+            shown += "\n  ... and {} more".format(len(names) - 15)
+        if self._msg(
+            "Remove {} embedded 3D model(s) that no footprint references "
+            "({:.1f} MB of board file)?\n\n{}\n\n"
+            "1. Save the project in KiCad first (Ctrl+S).\n"
+            "2. The board is backed up first; Revert restores it.\n"
+            "3. Afterwards, close the PCB editor WITHOUT saving and reopen it.\n\n"
+            "Continue?".format(len(self.unused),
+                               sum(u["bytes"] for u in self.unused) / 1e6, shown),
+            wx.YES_NO | wx.ICON_WARNING,
+        ) != wx.YES:
+            return
+        busy = wx.BusyCursor()
+        try:
+            session = portability.Session(self.project_dir)
+            res = portability.remove_unused_embedded(session)
+            session.save_manifest({"unused_embedded": res})
+        except Exception as exc:
+            del busy
+            self.refresh()
+            self._msg("Remove failed part-way:\n{}\n\n"
+                      "Every change made before the error is recorded. "
+                      "Click Revert to undo them.".format(exc),
+                      wx.OK | wx.ICON_ERROR)
+            return
+        del busy
+        self.refresh()
+        self._msg("Removed {} unused embedded 3D model(s); the board file is "
+                  "{:.1f} MB smaller.\n\n"
+                  "Close the PCB editor without saving, then reopen the project."
+                  .format(res["removed"], res["bytes"] / 1e6),
+                  wx.OK | wx.ICON_INFORMATION)
+
     def on_revert(self, _evt):
         if self._msg(
             "Revert all localized dependencies back to their originals?\n"
@@ -393,6 +451,7 @@ class LocalizeDialog(wx.Dialog):
         self.apply_sort()
         self.populate()
         self.btn_revert.Enable(portability.has_backup(self.project_dir))
+        self._update_unused()
         del busy
 
 
