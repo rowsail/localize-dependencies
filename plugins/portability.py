@@ -946,7 +946,12 @@ def localize_symbols(session, rows):
     library copies the whole .kicad_sym (so derived symbols keep their 'extends'
     parents) and remaps every instance of that library plus its lib_symbols
     cache entries together. Splitting one library across two nicknames would
-    leave the embedded symbol cache inconsistent, so we keep it whole."""
+    leave the embedded symbol cache inconsistent, so we keep it whole.
+
+    A folder library (KiCad 10: one .kicad_sym per symbol, usually named
+    *.kicad_symdir) is copied as a folder of its top-level *.kicad_sym files,
+    which is what KiCad reads. A library whose source can't be found is left
+    alone rather than remapped to a copy that doesn't exist."""
     project_dir = session.project_dir
     resolve = make_resolver(project_dir)
 
@@ -957,11 +962,13 @@ def localize_symbols(session, rows):
     if not nicks:
         return {"libraries": 0, "files_copied": 0, "remapped": 0}
 
-    src_file = {}   # nick -> resolved source .kicad_sym
+    src_file = {}   # nick -> resolved source .kicad_sym file or library folder
     for nick in nicks:
         uri = resolve_lib_uri(project_dir, "sym-lib-table", nick)
         if uri:
-            src_file[nick] = resolve(uri)
+            path = resolve(uri)
+            if os.path.isfile(path) or os.path.isdir(path):
+                src_file[nick] = path
     if not src_file:
         return {"libraries": 0, "files_copied": 0, "remapped": 0}
 
@@ -969,15 +976,30 @@ def localize_symbols(session, rows):
     copied = 0
     for nick, sfile in src_file.items():
         local_nick = nick + LOCAL_SUFFIX
-        local_lib = os.path.join(project_dir, LOCAL_LIB_DIRNAME, local_nick + ".kicad_sym")
-        session.mkdir(os.path.dirname(local_lib))
-        if os.path.isfile(sfile) and not os.path.isfile(local_lib):
-            session.wrote_new_file(local_lib)
-            shutil.copy2(sfile, local_lib)
-            session.written(local_lib)
-            copied += 1
-        entries[local_nick] = "${{KIPRJMOD}}/{}/{}.kicad_sym".format(
-            LOCAL_LIB_DIRNAME, local_nick)
+        if os.path.isdir(sfile):
+            ext = os.path.splitext(sfile.rstrip("/\\"))[1] or ".kicad_symdir"
+            local_name = local_nick + ext
+            local_lib = os.path.join(project_dir, LOCAL_LIB_DIRNAME, local_name)
+            if not os.path.exists(local_lib):
+                session.mkdir(local_lib)
+                for f in sorted(os.listdir(sfile)):
+                    src = os.path.join(sfile, f)
+                    if f.lower().endswith(".kicad_sym") and os.path.isfile(src):
+                        dst = os.path.join(local_lib, f)
+                        session.wrote_new_file(dst)
+                        shutil.copy2(src, dst)
+                        session.written(dst)
+                        copied += 1
+        else:
+            local_name = local_nick + ".kicad_sym"
+            local_lib = os.path.join(project_dir, LOCAL_LIB_DIRNAME, local_name)
+            session.mkdir(os.path.dirname(local_lib))
+            if not os.path.isfile(local_lib):
+                session.wrote_new_file(local_lib)
+                shutil.copy2(sfile, local_lib)
+                session.written(local_lib)
+                copied += 1
+        entries[local_nick] = "${{KIPRJMOD}}/{}/{}".format(LOCAL_LIB_DIRNAME, local_name)
 
     remapped = 0
     for sch in glob.glob(os.path.join(project_dir, "*.kicad_sch")):
