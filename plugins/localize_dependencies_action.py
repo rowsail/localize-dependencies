@@ -32,7 +32,7 @@ COL_TYPE, COL_REF, COL_NAME, COL_SOURCE, COL_STATUS = range(5)
 _COL_TITLES = ("Type", "Reference", "Name", "Source", "Status")
 GREY = wx.Colour(140, 140, 140)
 # Sort order when sorting by status: the localizable rows come first.
-_STATUS_ORDER = {"external": 0, "standard": 1, "embedded": 2, "missing": 3, "local": 4}
+_STATUS_ORDER = {"external": 0, "rebuild": 1, "standard": 2, "embedded": 3, "missing": 4, "local": 5}
 _TYPE_ORDER = {"symbol": 0, "footprint": 1, "model": 2}
 
 
@@ -64,7 +64,9 @@ def _localizable(row):
     # "embedded": a kicad-embed:// model, extracted to packages3D/.
     # Selectable but never ticked by default -- the board is already
     # self-contained with it.
-    return row["status"] in ("external", "standard", "embedded")
+    # "rebuild": a footprint whose library file is gone, rebuilt from the
+    # board's copy of it.
+    return row["status"] in ("external", "standard", "embedded", "rebuild")
 
 
 class LocalizeDialog(wx.Dialog):
@@ -78,7 +80,7 @@ class LocalizeDialog(wx.Dialog):
         self._populating = False
         # Checked by default: external rows. The "include standard" box adds the
         # standard rows. Selection is tracked by row key so a re-sort keeps it.
-        self._checked = {r["key"] for r in rows if r["status"] == "external"}
+        self._checked = {r["key"] for r in rows if r["status"] in ("external", "rebuild")}
 
         icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
         if os.path.exists(icon):
@@ -181,6 +183,7 @@ class LocalizeDialog(wx.Dialog):
     def _status_label(self, row):
         return {"external": "external", "standard": "standard lib",
                 "embedded": "embedded",
+                "rebuild": "missing: rebuild from board",
                 "local": "already local", "missing": "MISSING"}.get(
                     row["status"], row["status"])
 
@@ -337,6 +340,9 @@ class LocalizeDialog(wx.Dialog):
                          "{} schematic footprint fields".format(
                              r["libraries"], r["files_copied"], r["remapped"],
                              r.get("schematic_fields", 0)))
+            if r.get("rebuilt_from_board"):
+                parts.append("  {} footprint(s) rebuilt from the board copy "
+                             "(library file missing)".format(r["rebuilt_from_board"]))
             if r.get("schematic_skipped"):
                 parts.append("  {} schematic symbol(s) left unchanged (shared by "
                              "sheet instances not all localized, or naming a "
@@ -453,7 +459,7 @@ class LocalizeDialog(wx.Dialog):
     def refresh(self):
         busy = wx.BusyCursor()  # spinning cursor while the project is re-scanned
         self.rows = portability.scan_items(self.project_dir, self.include_std.GetValue())
-        self._checked = {r["key"] for r in self.rows if r["status"] == "external"}
+        self._checked = {r["key"] for r in self.rows if r["status"] in ("external", "rebuild")}
         if self.include_std.GetValue():
             self._checked |= {r["key"] for r in self.rows if r["status"] == "standard"}
         self.apply_sort()

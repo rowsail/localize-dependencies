@@ -18,6 +18,7 @@ import glob
 import hashlib
 import json
 import base64
+import math
 import os
 import re
 import shutil
@@ -482,6 +483,8 @@ def scan_items(project_dir, include_standard=False):
             nick = fpid.split(":", 1)[0] if ":" in fpid else ""
             uri = resolve_lib_uri(project_dir, "fp-lib-table", nick) if nick else None
             cat = classify_lib(uri, project_dir) if nick else "local"
+            if nick and not os.path.isfile(_footprint_file(project_dir, uri, fpid)):
+                cat = "rebuild"     # library or file gone: rebuild from the board copy
             rows.append({"type": "footprint", "ref": ref, "name": fpid,
                          "source": uri or "", "status": cat,
                          "key": ("footprint", rel, fi),
@@ -881,7 +884,277 @@ def classify_lib(uri, project_dir):
 
 
 def _wanted(cat, include_standard):
-    return cat == "external" or (cat == "standard" and include_standard)
+    return cat in ("external", "rebuild") or (cat == "standard" and include_standard)
+
+
+def _footprint_file(project_dir, uri, fpid):
+    """Path the footprint's .kicad_mod would have ('' when unresolvable)."""
+    if not uri or ":" not in fpid:
+        return ""
+    return os.path.join(make_resolver(project_dir)(uri), fpid.split(":", 1)[1] + ".kicad_mod")
+
+
+# --- rebuilding a library footprint from its board copy ----------------------
+#
+# A .kicad_pcb holds a full copy of every footprint it places, so a footprint
+# whose library is gone can be rebuilt from the board -- what KiCad's "Export
+# Footprints to Library" does (PCB_IO_KICAD_SEXPR::FootprintSave): orientation
+# to 0, flipped back to the front (top-bottom, KiCad's default), nets cleared,
+# reference REF**, placement data dropped. In the board file a footprint's
+# children are stored in its own frame, so the orientation changes only the
+# absolute angles of pads and texts; a flip mirrors y, swaps F./B. layers,
+# toggles the mirroring of text on front/back layers (other layers keep
+# theirs), maps angles (text a -> 180 - a, pad a -> -a) and, on pads, swaps
+# top/bottom chamfers and mirrors the drill offset and trapezoid delta. Zones, points and
+# dimensions are stored in board coordinates and are made local first.
+# Checked against KiCad 10's own FootprintSave on a 318-footprint board (all
+# four rotations, both sides): identical apart from equal-valued angle
+# spellings (-90 / 270) and "*.Cu" on through-hole pads (KiCad writes the
+# board's own copper layers).
+
+_REBUILD_DROP = {"at", "uuid", "path", "units", "net", "placed"}
+_XY_KEYS = {"at", "start", "end", "center", "mid", "xy", "pos"}
+_NUM = re.compile(r"-?\d+(\.\d+)?(e-?\d+)?$")
+
+
+def _fmt(v):
+    s = "{:.6f}".format(v).rstrip("0").rstrip(".")
+    return "0" if s in ("-0", "") else s
+
+
+def _flip_layer(name):
+    if name.startswith("B."):
+        return "F." + name[2:]
+    if name.startswith("F."):
+        return "B." + name[2:]
+    return name
+
+
+_KEEP_FIELDS = ("Reference", "Value", "Datasheet", "Description")
+
+
+def rebuild_footprint(text, fp, version, board_embeds=None, instance_fields=False):
+    """Library .kicad_mod text for the placed footprint `fp` (a list node of
+    the board `text`). `board_embeds` ({name: file node}) supplies embedded
+    3D models the footprint uses, copied into the footprint's own block.
+
+    By default the result is a clean library footprint: Value is the
+    footprint name, Datasheet and Description are empty, every other field
+    (LCSC, MPN, Manufacturer, ...) and the sheet name/file are dropped -- part
+    numbers belong in
+    the schematic, and a library footprint carrying one instance's part
+    number leaks it into every other part using that footprint.
+    instance_fields=True keeps the instance's fields, as KiCad's "Export
+    Footprints to Library" does."""
+    # Work on the footprint's own text: edits on the whole board text would
+    # cost board-size per edit (minutes per footprint on a 70 MB board).
+    board_text = text
+    text = board_text[fp.start:fp.end]
+    fp = sexpr.parse(text)
+    orient, back = _placement(fp)
+    at = fp.find("at")
+    px = float(at.children[1].value) if at and at.children[2:] else 0.0
+    py = float(at.children[2].value) if at and at.children[2:] else 0.0
+    cos_t, sin_t = math.cos(math.radians(orient)), math.sin(math.radians(orient))
+    ed = sexpr.Editor(text)
+
+    def zone_local(x, y):
+        """Footprint zones, points and dimensions are stored in board
+        coordinates, unlike every other child:
+        absolute = position + R(orientation) . local."""
+        ax, ay = x - px, y - py
+        return ax * cos_t - ay * sin_t, ax * sin_t + ay * cos_t
+
+    def angle(a, kind):
+        a -= orient
+        if back:
+            a = (180 - a) if kind == "text" else -a
+        a = (a + 180) % 360 - 180
+        return 180.0 if a == -180 else a
+
+    def drop(node):
+        start = node.start
+        while start > 0 and text[start - 1] in " \t":
+            start -= 1
+        if start > 0 and text[start - 1] == "\n":
+            start -= 1
+        ed.replace_span(start, node.end, "")
+
+    def _flip_mirror(t_node):
+        """A flip toggles the mirroring of text on a front/back layer (back
+        text normally comes to the front unmirrored, but a footprint drawn
+        inconsistently keeps its quirk); text on any other layer (Dwgs.User,
+        User.1, ...) keeps its mirroring, as KiCad does."""
+        lay, eff = t_node.find("layer"), t_node.find("effects")
+        if lay is None or eff is None or not lay.children[1:]:
+            return
+        old = lay.children[1].value
+        if not old.startswith(("F.", "B.")):
+            return
+        j = eff.find("justify")
+        has = j is not None and any(a_.value == "mirror" for a_ in j.children[1:])
+        want = not has
+        if want and not has:
+            if j is None:
+                ed.replace_span(eff.end - 1, eff.end - 1, " (justify mirror)")
+            else:
+                ed.replace_span(j.end - 1, j.end - 1, " mirror")
+        elif has and not want:
+            if all(a_.value == "mirror" for a_ in j.children[1:]):
+                drop(j)         # (justify mirror) -> nothing
+            else:
+                for a_ in j.children[1:]:
+                    if a_.value == "mirror":
+                        i = a_.start
+                        while i > 0 and text[i - 1] in " \t\n":
+                            i -= 1
+                        ed.replace_span(i, a_.end, "")
+
+    def walk(node, ctx):
+        for c in node.children:
+            if c.kind != "list":
+                continue
+            h = c.head()
+            if (node is fp and h in _REBUILD_DROP) or h == "net":
+                drop(c)
+                continue
+            if node is fp and not instance_fields and (
+                    h in ("sheetname", "sheetfile", "locked", "component_classes") or
+                    (h == "property" and len(c.children) >= 3
+                     and c.children[1].value not in _KEEP_FIELDS)):
+                drop(c)         # placement data, part numbers: see the docstring
+                continue
+            if (h in _XY_KEYS and len(c.children) >= 3 and _NUM.match(c.children[1].value or "")
+                    and _NUM.match(c.children[2].value or "")):
+                if ctx == "zone":
+                    lx, ly = zone_local(float(c.children[1].value), float(c.children[2].value))
+                    ed.replace_atom(c.children[1], _fmt(lx))
+                    ed.replace_atom(c.children[2], _fmt(-ly if back else ly))
+                elif back:
+                    ed.replace_atom(c.children[2], _fmt(-float(c.children[2].value)))
+                if h == "at" and ctx in ("text", "pad"):
+                    if len(c.children) >= 4 and _NUM.match(c.children[3].value or ""):
+                        a = angle(float(c.children[3].value), ctx)
+                        if a:
+                            ed.replace_atom(c.children[3], _fmt(a))
+                        else:   # KiCad leaves a zero angle out
+                            ed.replace_span(c.children[2].end, c.children[3].end, "")
+                    elif orient or back:
+                        a = angle(0.0, ctx)
+                        if a:
+                            ed.replace_span(c.children[2].end, c.children[2].end, " " + _fmt(a))
+                continue
+            if back and ctx == "pad" and h == "chamfer":
+                # PAD::Flip (top-bottom) swaps top and bottom corners
+                swap = {"top_left": "bottom_left", "bottom_left": "top_left",
+                        "top_right": "bottom_right", "bottom_right": "top_right"}
+                for a_ in c.children[1:]:
+                    if a_.value in swap:
+                        ed.replace_atom(a_, swap[a_.value])
+                continue
+            if (back and ctx == "pad" and h in ("offset", "rect_delta") and len(c.children) >= 3
+                    and _NUM.match(c.children[2].value or "")):
+                ed.replace_atom(c.children[2], _fmt(-float(c.children[2].value)))
+                continue
+            if back and h == "layer" and c.children[1:]:
+                ed.replace_atom(c.children[1], _flip_layer(c.children[1].value),
+                                force_quote=c.children[1].quoted)
+                continue
+            if back and h == "layers":
+                for a_ in c.children[1:]:
+                    ed.replace_atom(a_, _flip_layer(a_.value), force_quote=a_.quoted)
+                continue
+            if back and h == "justify":
+                continue        # handled at the text node, below
+            if h == "model":
+                continue
+            if back and h in ("property", "fp_text", "fp_text_box", "gr_text"):
+                _flip_mirror(c)
+            if back and h == "fp_text_box":
+                # a text box's angle is relative to the footprint: flip only
+                ang = c.find("angle")
+                a = (180 - float(ang.children[1].value)) if ang is not None else 180.0
+                a = (a + 180) % 360 - 180
+                a = 180.0 if a == -180 else a
+                if ang is not None and not a:
+                    drop(ang)
+                elif ang is not None:
+                    ed.replace_atom(ang.children[1], _fmt(a))
+                else:
+                    lay = c.find("layer")
+                    ed.replace_span(lay.start, lay.start, "(angle {}) ".format(_fmt(a)))
+            if back and h == "dimension":
+                hgt = c.find("height")
+                if hgt is not None and _NUM.match(hgt.children[1].value or ""):
+                    ed.replace_atom(hgt.children[1], _fmt(-float(hgt.children[1].value)))
+            walk(c, "zone" if (h in ("zone", "point", "dimension") or ctx == "zone") else
+                 "pad-primitive" if (h == "primitives" or ctx == "pad-primitive") else
+                 "pad" if h == "pad" else "text" if h in ("property", "fp_text") else ctx)
+
+    walk(fp, "fp")
+    bare = fp.children[1].value.split(":", 1)[-1]
+    for c in fp.children:
+        if not (c.kind == "list" and c.head() == "property" and len(c.children) >= 3):
+            continue
+        field = c.children[1].value
+        if field == "Reference":
+            ed.replace_atom(c.children[2], "REF**", force_quote=True)
+        elif instance_fields:
+            continue
+        elif field == "Value":
+            ed.replace_atom(c.children[2], bare, force_quote=True)
+        elif field in ("Datasheet", "Description"):
+            ed.replace_atom(c.children[2], "", force_quote=True)
+    if back:
+        ed.replace_atom(fp.find("layer").children[1], "F.Cu", force_quote=True)
+    name = fp.children[1]
+    ed.replace_atom(name, name.value.split(":", 1)[-1], force_quote=True)
+    ed.replace_span(name.end, name.end, '\n\t\t(version {})\n\t\t(generator "pcbnew")\n'
+                    '\t\t(generator_version "10.0")'.format(version))
+    if board_embeds and fp.find("embedded_files") is None:
+        wanted = [m.children[1].value[len(EMBED_PREFIX):] for m in fp.find_all("model")
+                  if m.children[1:] and m.children[1].value.startswith(EMBED_PREFIX)]
+        files = [board_embeds[n] for n in wanted if n in board_embeds]
+        if files:
+            ed.replace_span(fp.end - 1, fp.end - 1, "\t(embedded_files\n" + "".join(
+                "\t\t\t" + board_text[f.start:f.end] + "\n" for f in files) + "\t\t)\n\t")
+    out = ed.result()
+    # the block was indented one level inside the board; a library file isn't
+    return re.sub(r"\n\t", "\n", out) + "\n"
+
+
+def _placement(fp):
+    """(orientation in degrees, on the back?) of a placed footprint."""
+    at, lay = fp.find("at"), fp.find("layer")
+    orient = float(at.children[3].value) if at and len(at.children) > 3 else 0.0
+    return orient, bool(lay and lay.children[1:] and lay.children[1].value == "B.Cu")
+
+
+def _write_rebuilt(session, path, mod):
+    sexpr.parse(mod)
+    session.wrote_new_file(path)
+    tmp = path + ".portability-tmp"
+    with open(tmp, "w", encoding="utf-8", newline="") as fh:
+        fh.write(mod)
+    os.replace(tmp, path)
+    session.written(path)
+
+
+def _best_instances(root):
+    """{footprint id: placed footprint node to rebuild from}: an instance on
+    the front at 0 degrees if there is one (nothing to undo), else on the
+    front, else any."""
+    best = {}
+
+    def rank(fp):
+        orient, back = _placement(fp)
+        return (2 if back else 0) + (0 if orient == 0 else 1)
+    for fp in root.find_all("footprint"):
+        if fp.children[1:] and fp.children[1].kind == "atom":
+            fid = fp.children[1].value
+            if fid not in best or rank(fp) < rank(best[fid]):
+                best[fid] = fp
+    return best
 
 
 def localize_footprints(session, rows):
@@ -893,7 +1166,8 @@ def localize_footprints(session, rows):
     The schematic symbols' Footprint fields follow (see
     _sync_schematic_footprints), or the next "Update PCB from Schematic" would
     swap the footprints straight back to the global library. A footprint whose
-    library file can't be found is left alone."""
+    library file can't be found is rebuilt from its copy in the board
+    (rebuild_footprint)."""
     project_dir = session.project_dir
     resolve = make_resolver(project_dir)
     keys = {r["key"] for r in rows if r["type"] == "footprint"}
@@ -905,14 +1179,19 @@ def localize_footprints(session, rows):
         by_pcb.setdefault(k[1], set()).add(k)
 
     entries = {}
-    src_dir_cache = {}
-    copied = remapped = 0
+    src_dir_cache = {}   # nick -> (resolved library dir, inside the project?)
+    restored = set()     # footprint ids rebuilt into their own project library
+    copied = remapped = rebuilt = 0
     moved = {}          # board reference -> (old fpid, new fpid)
     for rel, kset in by_pcb.items():
         pcb = os.path.join(project_dir, rel)
         text = _read(pcb)
         root = sexpr.parse(text)
         editor = sexpr.Editor(text)
+        best = _best_instances(root)
+        ver = root.find("version")
+        version = ver.children[1].value if ver and ver.children[1:] else "20260206"
+        board_embeds = _embedded_files(root)
         for fi, fp in enumerate(root.find_all("footprint")):
             if ("footprint", rel, fi) not in kset:
                 continue
@@ -921,17 +1200,32 @@ def localize_footprints(session, rows):
                 continue
             nick, name = atom.value.split(":", 1)
             if nick not in src_dir_cache:
-                src_dir_cache[nick] = resolve(
-                    resolve_lib_uri(project_dir, "fp-lib-table", nick) or "")
+                uri = resolve_lib_uri(project_dir, "fp-lib-table", nick) or ""
+                src_dir_cache[nick] = (resolve(uri), "${KIPRJMOD}" in uri)
+            src_dir, in_project = src_dir_cache[nick]
+            src_file = os.path.join(src_dir, name + ".kicad_mod")
+            if in_project:
+                # already a project library: never re-localized. If it has
+                # lost this footprint, put the rebuilt file back where the
+                # table says it lives; the footprint id is already right.
+                if not os.path.isfile(src_file) and atom.value not in restored:
+                    session.mkdir(src_dir)
+                    _write_rebuilt(session, src_file,
+                                   rebuild_footprint(text, best[atom.value], version, board_embeds))
+                    restored.add(atom.value)
+                    rebuilt += 1
+                continue
             local_nick = nick + LOCAL_SUFFIX
             local_dir = os.path.join(project_dir, LOCAL_LIB_DIRNAME,
                                      local_nick + LOCAL_FP_SUFFIX)
             session.mkdir(local_dir)
-            src_file = os.path.join(src_dir_cache[nick], name + ".kicad_mod")
             dst_file = os.path.join(local_dir, name + ".kicad_mod")
             if not (os.path.isfile(src_file) or os.path.isfile(dst_file)):
-                continue    # nothing to point at: leave this footprint alone
-            if os.path.isfile(src_file) and not os.path.isfile(dst_file):
+                # library file gone: rebuild it from the board's copy
+                _write_rebuilt(session, dst_file,
+                               rebuild_footprint(text, best[atom.value], version, board_embeds))
+                rebuilt += 1
+            elif os.path.isfile(src_file) and not os.path.isfile(dst_file):
                 session.wrote_new_file(dst_file)
                 shutil.copy2(src_file, dst_file)
                 session.written(dst_file)
@@ -948,6 +1242,7 @@ def localize_footprints(session, rows):
     add_lib_entries(session, "fp", entries)
     sch = _sync_schematic_footprints(session, moved)
     return {"libraries": len(entries), "files_copied": copied, "remapped": remapped,
+            "rebuilt_from_board": rebuilt,
             "schematic_fields": sch["updated"], "schematic_skipped": sch["skipped"]}
 
 

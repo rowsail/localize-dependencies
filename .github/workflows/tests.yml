@@ -55,3 +55,12 @@ jobs:
         env:
           REQUIRE_KICAD: "1"
         run: python3 tests/test_kicad_projects.py
+
+      # The footprint rebuild against KiCad's own library save, footprint by
+      # footprint (uses the pcbnew module the KiCad package installs).
+      - name: Check footprint rebuild against KiCad on the demo boards
+        run: |
+          for b in /usr/share/kicad/demos/pic_programmer/pic_programmer.kicad_pcb \
+                   /usr/share/kicad/demos/openair-max/One-Air-Max.kicad_pcb; do
+            if [ -f "$b" ]; then python3 tools/verify_rebuild.py "$b"; fi
+          done

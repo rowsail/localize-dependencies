@@ -84,6 +84,20 @@ install it, and restart the PCB editor.
    files.
 5. To undo, run the plugin again and hit Revert.
 
+### Footprints whose library is gone
+
+A board file holds a complete copy of every footprint it places. When a
+footprint's library (or just its `.kicad_mod`) can't be found, the row shows
+*missing: rebuild from board* and is ticked: Localize rebuilds the library
+footprint from the board's copy, the way KiCad's *Export Footprints to
+Library* does (rotation undone, flipped back to the front, nets cleared,
+reference `REF**`), into `libs/<name>_local.pretty`; if the library was
+already a project library, the file is put back where it belongs and nothing
+is remapped. The rebuilt footprint is a clean library footprint: Value is its
+name and part-number fields (LCSC, MPN, ...) are left out, so one placed
+part's numbers can't leak into every other part using that footprint. The
+board's 3D model paths (and any embedded model) come along.
+
 ### Embedded 3D models
 
 KiCad 9 and later can embed a 3D model in the board file itself
@@ -117,7 +131,12 @@ Each test file runs on its own with `python tests/<file>.py`:
 - `test_embedded.py`: embedded 3D models. Needs `zstandard` or the `zstd` tool.
 - `test_symbols.py`: symbol libraries, single-file and folder (`.kicad_symdir`).
 - `test_footprints.py`: footprint localization updates the schematic's
-  Footprint fields too, including symbols shared by reused sheets.
+  Footprint fields too, including symbols shared by reused sheets, and
+  footprints are rebuilt from the board when their library is gone.
+- `tools/verify_rebuild.py <board>`: checks the rebuild against KiCad's own
+  library save, footprint by footprint. Needs KiCad's `pcbnew` Python module.
+  `tools/make_feature_board.py` writes a board with the harder cases (text
+  boxes, footprint dimensions, net ties, both sides, 30° rotation) to run it on.
 - `test_dialog.py`: the dialog's prompts. Needs wx and kipy, for example the
   plugin's own KiCad venv.
 - `test_kicad_projects.py`: localizes KiCad's demo projects, then checks with
