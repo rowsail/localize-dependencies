@@ -1,5 +1,8 @@
 """Collect the symbols a project's schematic actually uses into ONE project
-symbol library (a KiCad 10 folder library, one .kicad_sym per symbol).
+symbol library (a KiCad 10 folder library, one .kicad_sym per symbol) -- or,
+with --footprints, the footprints its boards place into ONE footprint
+library, libs/<NICK>.pretty (schematic Footprint fields follow; a footprint
+whose library file is gone is rebuilt from the board).
 
     python tools/onelib.py <project_dir> [--name NICK] [--root SHEET] [--apply] [--remove-old]
 
@@ -274,6 +277,149 @@ def apply(proj, nick, sheets, need, newname, lib_paths, remove_old):
     return len(seen), sorted(merged_local), removed
 
 
+# --- footprints ---------------------------------------------------------------
+
+def _fp_body(text):
+    """A footprint file compared without its name and UUIDs."""
+    t = re.sub(r'\(uuid "[^"]*"\)', "", text)
+    t = re.sub(r'^\(footprint "[^"]*"', "(footprint", t.lstrip())
+    return " ".join(t.split())
+
+
+def plan_footprints(proj, nick):
+    """Footprints the project's boards place: {fpid: (source text, how)},
+    the new names, renames, and the project-local libraries they came from."""
+    resolve = portability.make_resolver(proj)
+    used = collections.Counter()
+    boards = {}
+    for pcb in sorted(glob.glob(os.path.join(proj, "*.kicad_pcb"))):
+        text = _read(pcb)
+        root = sexpr.parse(text)
+        boards[pcb] = (text, root)
+        for fp in root.find_all("footprint"):
+            if fp.children[1:] and ":" in (fp.children[1].value or ""):
+                used[fp.children[1].value] += 1
+    need, lib_paths = {}, {}
+    for fid in used:
+        lib, name = fid.split(":", 1)
+        uri = portability.resolve_lib_uri(proj, "fp-lib-table", lib)
+        path = os.path.join(resolve(uri), name + ".kicad_mod") if uri else ""
+        if uri and os.path.isdir(resolve(uri)):
+            lib_paths[lib] = (uri, resolve(uri))
+        if path and os.path.isfile(path):
+            need[fid] = (_read(path), "library")
+        else:                       # library file gone: rebuild from a board copy
+            for text, root in boards.values():
+                best = portability._best_instances(root).get(fid)
+                if best is not None:
+                    ver = root.find("version").children[1].value
+                    need[fid] = (portability.rebuild_footprint(
+                        text, best, ver, portability._embedded_files(root),
+                        flip=portability.flip_direction()), "rebuilt from board")
+                    break
+    newname = {fid: fid.split(":", 1)[1] for fid in need}
+    by = collections.defaultdict(list)
+    for fid in need:
+        by[newname[fid]].append(fid)
+    for name, fids in by.items():
+        if len(fids) > 1 and len({_fp_body(need[f][0]) for f in fids}) > 1:
+            fids.sort(key=lambda f: -used[f])
+            for f in fids[1:]:
+                newname[f] = "{}_{}".format(name, f.split(":", 1)[0].replace("_local", ""))
+    taken = set()
+    for fid in sorted(newname, key=lambda f: (newname[f] != portable(newname[f]), newname[f])):
+        p, q, i = portable(newname[fid]), None, 1
+        q = p
+        while q in taken and q != newname[fid]:
+            i += 1
+            q = "{}_{}".format(p, i)
+        newname[fid] = q
+        taken.add(q)
+    low = collections.defaultdict(set)
+    for v in newname.values():
+        low[v.lower()].add(v)
+    for group in low.values():
+        if len(group) > 1:
+            for f, v in list(newname.items()):
+                if v in group:
+                    newname[f] = unclash_case(v)
+    renamed = {f: newname[f] for f in need if newname[f] != f.split(":", 1)[1]}
+    return boards, used, need, newname, renamed, lib_paths
+
+
+def apply_footprints(proj, nick, sheets, boards, need, newname, lib_paths, remove_old):
+    folder = os.path.join(proj, "libs", nick + ".pretty")
+    if os.path.exists(folder):
+        sys.exit(folder + " already exists")
+    os.makedirs(folder)
+    written = set()
+    for fid, (text, _how) in need.items():
+        n = newname[fid]
+        if n in written:
+            continue
+        written.add(n)
+        t = re.sub(r'^(\s*\(footprint\s+)"[^"]*"', lambda m: m.group(1) + '"%s"' % n, text, count=1)
+        sexpr.parse(t)
+        with open(os.path.join(folder, n + ".kicad_mod"), "w", encoding="utf-8", newline="") as fh:
+            fh.write(t)
+    new_id = {fid: "{}:{}".format(nick, newname[fid]) for fid in need}
+    for pcb, (text, root) in boards.items():
+        ed = sexpr.Editor(text)
+        for fp in root.find_all("footprint"):
+            a = fp.children[1] if fp.children[1:] else None
+            if a is not None and a.value in new_id:
+                ed.replace_atom(a, new_id[a.value], force_quote=True)
+        out = ed.result()
+        sexpr.parse(out)
+        with open(pcb, "w", encoding="utf-8", newline="") as fh:
+            fh.write(out)
+    # Footprint fields follow: placed symbols, the schematics' lib_symbols
+    # caches and the project's own symbol libraries (a symbol's default
+    # footprint, used when it is placed afresh).
+    resolve = portability.make_resolver(proj)
+    targets = [os.path.join(proj, f) for f in sheets]
+    stable = portability.parse_lib_table(os.path.join(proj, "sym-lib-table"))
+    for uri in stable.values():
+        if "${KIPRJMOD}" in uri:
+            p_ = resolve(uri)
+            targets += ([os.path.join(p_, x) for x in sorted(os.listdir(p_)) if x.endswith(".kicad_sym")]
+                        if os.path.isdir(p_) else [p_])
+    for path in targets:
+        if not os.path.isfile(path):
+            continue
+        text = _read(path)
+        root = sexpr.parse(text)
+        ed = sexpr.Editor(text)
+        for c in root.iter_lists():
+            if (c.head() == "property" and len(c.children) >= 3
+                    and c.children[1].value == "Footprint" and c.children[2].value in new_id):
+                ed.replace_atom(c.children[2], new_id[c.children[2].value], force_quote=True)
+        out = ed.result()
+        if out != text:
+            sexpr.parse(out)
+            with open(path, "w", encoding="utf-8", newline="") as fh:
+                fh.write(out)
+    table = os.path.join(proj, "fp-lib-table")
+    t = _read(table) if os.path.exists(table) else "(fp_lib_table\n\t(version 7)\n)\n"
+    merged_local = {n for n, (uri, _p) in lib_paths.items() if "${KIPRJMOD}" in uri}
+    for n in merged_local:
+        t = re.sub(r'[ \t]*\(lib \(name "{}"\)[^\n]*\n'.format(re.escape(n)), "", t)
+    entry = ('\t(lib (name "{}")(type "KiCad")(uri "${{KIPRJMOD}}/libs/{}.pretty")'
+             '(options "")(descr "Project footprints: only those the board uses"))\n').format(nick, nick)
+    close = t.rstrip().rfind(")")
+    t = t[:close] + entry + t[close:]
+    with open(table, "w", encoding="utf-8", newline="") as fh:
+        fh.write(t)
+    removed = []
+    if remove_old:
+        for n in sorted(merged_local):
+            p = lib_paths[n][1]
+            if os.path.isdir(p) and os.path.abspath(p) != os.path.abspath(folder):
+                shutil.rmtree(p)
+                removed.append(os.path.relpath(p, proj))
+    return len(written), sorted(merged_local), removed
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     ap.add_argument("project")
@@ -282,10 +428,28 @@ def main():
     ap.add_argument("--apply", action="store_true", help="write the changes")
     ap.add_argument("--remove-old", action="store_true",
                     help="with --apply, delete the merged project-local libraries")
+    ap.add_argument("--footprints", action="store_true",
+                    help="collect the board's footprints into libs/<NICK>.pretty instead of symbols")
     a = ap.parse_args()
     proj = os.path.abspath(a.project)
     root = root_sheet(proj, a.root)
     nick = a.name or os.path.splitext(root)[0]
+    if a.footprints:
+        sheets = hierarchy(proj, root)
+        boards, used, need, newname, renamed, lib_paths = plan_footprints(proj, nick)
+        report = {
+            "library": "libs/{}.pretty".format(nick),
+            "placed_footprints": sum(used.values()), "unique_used": len(used),
+            "footprints": len(set(newname.values())),
+            "rebuilt_from_board": sorted(f for f, v in need.items() if v[1] != "library"),
+            "renamed": renamed,
+        }
+        if a.apply:
+            n, merged, removed = apply_footprints(proj, nick, sheets, boards, need, newname,
+                                                  lib_paths, a.remove_old)
+            report.update({"written": n, "table_entries_replaced": merged, "removed": removed})
+        print(json.dumps(report, indent=1, ensure_ascii=False))
+        return
     sheets, used, need, newname, renamed, lib_paths = plan(proj, nick, root)
     report = {
         "library": "libs/{}.kicad_symdir".format(nick),

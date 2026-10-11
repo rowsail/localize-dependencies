@@ -189,6 +189,12 @@ names that would then differ only in case use `milli` / `MEG` (`100mohm` →
 `100milliohm`, `100Mohm` → `100MEGohm`). Only names change; Value fields don't.
 Close KiCad and commit the project first. `kicad-cli` writes the library.
 
+`--footprints` does the same for footprints: the boards' footprints go into
+one library, `libs/<project>.pretty` (only those placed; one missing from its
+library is rebuilt from the board), and the board, the schematic Footprint
+fields, the schematics' cached symbols and the project symbol library's
+default footprints are pointed at it.
+
 ## Building the package
 
 Run `python build.py`. It produces `dist/localize-dependencies-<version>.zip` in
