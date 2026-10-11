@@ -225,6 +225,7 @@ class Session:
         self._created_files = []
         self._created_dirs = []
         self._hashes = {}      # rel path -> sha256 after our last write
+        self._unverified = []  # backed-up paths Revert cannot vouch for
         self.summary = {}
         man = _load_manifest(self.project_dir)
         if man:
@@ -233,6 +234,7 @@ class Session:
             self._created_files = list(man.get("created_files", []))
             self._created_dirs = list(man.get("created_dirs", []))
             self._hashes = dict(man.get("hashes", {}))
+            self._unverified = list(man.get("unverified", []))
             self.summary = man.get("summary", {})
 
     def _rel(self, path):
@@ -242,8 +244,16 @@ class Session:
     def backup(self, path):
         """Copy `path` into the backup store once, before it is modified."""
         rel = self._rel(path)
-        if (rel in self._backed or rel in self._created_files
-                or not os.path.isfile(path)):
+        if rel in self._backed and os.path.isfile(path):
+            # Backed up by an earlier run. If the file changed since we last
+            # wrote it (or that run kept no hash), Revert would silently throw
+            # those in-between edits away with this run's: flag it so Revert asks.
+            if (rel not in self._unverified
+                    and self._hashes.get(rel) != _sha256(path)):
+                self._unverified.append(rel)
+                self._save()
+            return
+        if rel in self._created_files or not os.path.isfile(path):
             return
         dest = os.path.join(self.state_dir, "backup", rel)
         os.makedirs(os.path.dirname(dest), exist_ok=True)
@@ -283,6 +293,7 @@ class Session:
             "created_files": self._created_files,
             "created_dirs": self._created_dirs,
             "hashes": self._hashes,
+            "unverified": self._unverified,
             "summary": self.summary,
         }
         mpath = os.path.join(self.state_dir, MANIFEST_NAME)
@@ -308,15 +319,27 @@ def has_backup(project_dir):
 
 
 def revert_conflicts(project_dir):
-    """Files changed since we last wrote them (edited by the user, or by KiCad
-    saving over them). Revert would discard those edits."""
+    """Files Revert cannot restore without possibly discarding edits:
+    - changed since we last wrote them (edited by the user, or by KiCad
+      saving over them);
+    - edited between two runs (marked 'unverified' when the later run
+      touched them);
+    - backed up with no recorded hash (a manifest from a version that kept
+      none), so there is no way to tell."""
     man = _load_manifest(os.path.abspath(project_dir)) or {}
-    out = []
-    for rel, sha in sorted(man.get("hashes", {}).items()):
+    hashes = man.get("hashes", {})
+    out = set()
+    for rel, sha in hashes.items():
         p = os.path.join(project_dir, rel)
         if os.path.isfile(p) and _sha256(p) != sha:
-            out.append(rel)
-    return out
+            out.add(rel)
+    for rel in man.get("unverified", []):
+        if os.path.isfile(os.path.join(project_dir, rel)):
+            out.add(rel)
+    for e in man.get("backed_up", []):
+        if e["path"] not in hashes and os.path.isfile(os.path.join(project_dir, e["path"])):
+            out.add(e["path"])
+    return sorted(out)
 
 
 def revert(project_dir, force=False):
@@ -380,6 +403,7 @@ def revert(project_dir, force=False):
         man["backed_up"] = kept_backed
         man["created_files"] = kept_created
         man["hashes"] = {p: h for p, h in man.get("hashes", {}).items() if p in kept}
+        man["unverified"] = [p for p in man.get("unverified", []) if p in kept]
         mpath = os.path.join(state_dir, MANIFEST_NAME)
         with open(mpath, "w", encoding="utf-8") as fh:
             json.dump(man, fh, indent=2)

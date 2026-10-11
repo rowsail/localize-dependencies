@@ -166,6 +166,51 @@ def test_revert_keeps_later_edits_unless_forced():
         shutil.rmtree(root)
 
 
+def test_edits_between_runs_are_not_silently_reverted():
+    root, proj = _project()
+    try:
+        pcb = os.path.join(proj, "board.kicad_pcb")
+        _run(proj, _rows(proj, "model", "R1"))
+        with open(pcb, "a", encoding="utf-8", newline="") as fh:
+            fh.write("\n")                       # the user edits and saves
+        _run(proj, _rows(proj, "model", "R2"))     # a later run touches it again
+        after_second = _bytes(pcb)
+        assert portability.revert_conflicts(proj) == ["board.kicad_pcb"]
+        res = portability.revert(proj)
+        assert any("board.kicad_pcb" in e for e in res["errors"]), res
+        assert _bytes(pcb) == after_second, "left alone, not silently restored"
+        assert portability.has_backup(proj), "still pending for a forced revert"
+        res = portability.revert(proj, force=True)
+        assert res["errors"] == [], res
+        assert not os.path.exists(os.path.join(proj, ".portability"))
+    finally:
+        shutil.rmtree(root)
+
+
+def test_manifest_without_hashes_asks_before_reverting():
+    import json
+    root, proj = _project()
+    try:
+        pcb = os.path.join(proj, "board.kicad_pcb")
+        original = _bytes(pcb)
+        _run(proj, _rows(proj, "model"))
+        # what a 1.0.x manifest looks like: no hashes, no unverified list
+        mpath = os.path.join(proj, ".portability", "manifest.json")
+        with open(mpath, encoding="utf-8") as fh:
+            man = json.load(fh)
+        man.pop("hashes"), man.pop("unverified", None)
+        with open(mpath, "w", encoding="utf-8") as fh:
+            json.dump(man, fh)
+        localized = _bytes(pcb)
+        assert portability.revert_conflicts(proj) == ["board.kicad_pcb"]
+        portability.revert(proj)
+        assert _bytes(pcb) == localized, "not restored without being asked"
+        portability.revert(proj, force=True)
+        assert _bytes(pcb) == original
+    finally:
+        shutil.rmtree(root)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):

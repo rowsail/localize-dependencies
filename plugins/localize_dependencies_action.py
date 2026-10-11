@@ -416,7 +416,9 @@ class LocalizeDialog(wx.Dialog):
         conflicts = portability.revert_conflicts(self.project_dir)
         if conflicts:
             answer = self._msg(
-                "These files changed after they were localized:\n\n" +
+                "These files changed after they were localized, or cannot be\n"
+                "checked (edited between runs, or localized by an older\n"
+                "version that kept no record):\n\n" +
                 "\n".join(conflicts[:15]) +
                 ("\n..." if len(conflicts) > 15 else "") +
                 "\n\nYes: revert them anyway (those later edits are lost).\n"
