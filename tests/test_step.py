@@ -20,7 +20,7 @@ from test_safety import _bytes, _write  # noqa: E402
 def _project():
     root = tempfile.mkdtemp()
     proj = os.path.join(root, "proj")
-    m = os.path.join(proj, "packages3D", "Parts.3dshapes")
+    m = os.path.join(proj, "packages3D")
     _write(os.path.join(m, "R.wrl"), "vrml R")
     _write(os.path.join(m, "R.step"), "step R")
     _write(os.path.join(m, "Q.wrl"), "vrml Q, no STEP twin")
@@ -28,9 +28,9 @@ def _project():
     _write(os.path.join(m, "U.STP"), "step U")
     ext = os.path.join(root, "ext.pretty")
     _write(os.path.join(ext, "X.kicad_mod"),
-           '(footprint "X" (model "${KIPRJMOD}/packages3D/Parts.3dshapes/R.wrl"))\n')
+           '(footprint "X" (model "${KIPRJMOD}/packages3D/R.wrl"))\n')
     _write(os.path.join(proj, "libs", "Mine.pretty", "R.kicad_mod"),
-           '(footprint "R"\n\t(model "${KIPRJMOD}/packages3D/Parts.3dshapes/R.wrl")\n)\n')
+           '(footprint "R"\n\t(model "${KIPRJMOD}/packages3D/R.wrl")\n)\n')
     _write(os.path.join(proj, "fp-lib-table"),
            '(fp_lib_table\n\t(version 7)\n'
            '\t(lib (name "Mine")(type "KiCad")(uri "${KIPRJMOD}/libs/Mine.pretty")(options "")(descr ""))\n'
@@ -39,11 +39,11 @@ def _project():
     _write(os.path.join(proj, "board.kicad_pcb"),
            "(kicad_pcb\n"
            '\t(footprint "Mine:R" (property "Reference" "R1")'
-           ' (model "${KIPRJMOD}/packages3D/Parts.3dshapes/R.wrl"))\n'
+           ' (model "${KIPRJMOD}/packages3D/R.wrl"))\n'
            '\t(footprint "Mine:Q" (property "Reference" "Q1")'
-           ' (model "${KIPRJMOD}/packages3D/Parts.3dshapes/Q.wrl"))\n'
+           ' (model "${KIPRJMOD}/packages3D/Q.wrl"))\n'
            '\t(footprint "Mine:U" (property "Reference" "U1")'
-           ' (model "${KIPRJMOD}/packages3D/Parts.3dshapes/U.wrl"))\n'
+           ' (model "${KIPRJMOD}/packages3D/U.wrl"))\n'
            '\t(footprint "Mine:E" (property "Reference" "E1") (model "kicad-embed://E.wrl"))\n'
            '\t(embedded_files (file (name "E.wrl") (type model) (data |AA|) (checksum "0"))\n'
            '\t\t(file (name "E.step") (type model) (data |AA|) (checksum "0")))\n'
@@ -73,13 +73,13 @@ def test_use_step_then_revert():
         s.save_manifest({"step_models": res})
         assert res == {"references": 4, "files": 2}, res
         board = open(pcb, encoding="utf-8").read()
-        assert "Parts.3dshapes/R.step" in board and "Parts.3dshapes/U.STP" in board
-        assert "Parts.3dshapes/Q.wrl" in board, "no STEP twin: left alone"
+        assert "packages3D/R.step" in board and "packages3D/U.STP" in board
+        assert "packages3D/Q.wrl" in board, "no STEP twin: left alone"
         assert '"kicad-embed://E.step"' in board
         assert "R.step" in open(lib, encoding="utf-8").read()
         assert _bytes(os.path.join(ext, "X.kicad_mod")) == before[2], "not a project library"
         assert portability.scan_vrml_models(proj) == []
-        assert os.path.exists(os.path.join(proj, "packages3D", "Parts.3dshapes", "R.wrl")), \
+        assert os.path.exists(os.path.join(proj, "packages3D", "R.wrl")), \
             "the .wrl files are not deleted"
         res = portability.revert(proj)
         assert res["errors"] == [], res
@@ -105,7 +105,7 @@ def test_kicad_path_variables_resolve():
         with open(pcb, encoding="utf-8") as fh:
             t = fh.read()
         _write(pcb, t.replace('"Mine:Q" (property "Reference" "Q1") (model '
-                              '"${KIPRJMOD}/packages3D/Parts.3dshapes/Q.wrl")',
+                              '"${KIPRJMOD}/packages3D/Q.wrl")',
                               '"Mine:Q" (property "Reference" "Q1") (model "${MY3D}/G.wrl")'))
         steps = [r["step"] for r in portability.scan_vrml_models(proj)]
         assert "${MY3D}/G.step" in steps, "a KiCad path variable (Configure Paths) resolves"

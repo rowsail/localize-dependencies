@@ -34,6 +34,7 @@ jobs:
           python tests/test_symbols.py
           python tests/test_footprints.py
           python tests/test_step.py
+          python tests/test_models.py
           xvfb-run -a python tests/test_dialog.py
 
   # Localizes KiCad's own demo projects and has kicad-cli judge the result.

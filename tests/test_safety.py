@@ -79,7 +79,7 @@ def test_second_run_keeps_first_undo():
 def test_copies_never_overwrite():
     root, proj = _project()
     try:
-        mine = os.path.join(proj, "packages3D", "Parts.3dshapes", "R.step")
+        mine = os.path.join(proj, "packages3D", "R.step")   # flat: no subfolders
         _write(mine, "the user's own model")
         _run(proj, _rows(proj, "model"))
         d = os.path.dirname(mine)
@@ -89,8 +89,8 @@ def test_copies_never_overwrite():
         assert got["R_1.step"] == b"model A" and got["R_1.wrl"] == b"wrl A", got
         assert got["R_2.step"] == b"model B", got
         text = _bytes(os.path.join(proj, "board.kicad_pcb")).decode()
-        assert "${KIPRJMOD}/packages3D/Parts.3dshapes/R_1.step" in text
-        assert "${KIPRJMOD}/packages3D/Parts.3dshapes/R_2.step" in text
+        assert "${KIPRJMOD}/packages3D/R_1.step" in text
+        assert "${KIPRJMOD}/packages3D/R_2.step" in text
         portability.revert(proj)
         assert _bytes(mine) == b"the user's own model", "revert deleted a user file"
     finally:
@@ -156,7 +156,7 @@ def test_revert_keeps_later_edits_unless_forced():
         res = portability.revert(proj)
         assert _bytes(pcb) == edited, "unforced revert overwrote a later edit"
         assert any("board.kicad_pcb" in e for e in res["errors"])
-        assert not os.path.exists(os.path.join(proj, "packages3D", "Parts.3dshapes", "R.step"))
+        assert not os.path.exists(os.path.join(proj, "packages3D", "R.step"))
 
         res = portability.revert(proj, force=True)
         assert res["errors"] == [], res

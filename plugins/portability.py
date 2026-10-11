@@ -201,6 +201,10 @@ def classify(raw, project_dir):
     if raw.startswith(EMBED_PREFIX):
         return "missing"
     if "${KIPRJMOD}" in raw:
+        flat = raw.replace("\\", "/")
+        if re.match(r"\$\{KIPRJMOD\}/" + LOCAL_3D_DIRNAME + r"/.+/[^/]+$", flat):
+            # local, but in a packages3D subfolder: Localize moves it up
+            return "nested" if os.path.isfile(make_resolver(project_dir)(raw)) else "missing"
         return "local"
     resolved = make_resolver(project_dir)(raw)
     is_std = bool(re.search(r"\$\{KICAD\d*_3DMODEL_DIR\}", raw)) or (
@@ -384,6 +388,7 @@ def revert(project_dir, force=False):
         src = os.path.join(state_dir, entry["backup"])
         dst = os.path.join(project_dir, entry["path"])
         try:
+            os.makedirs(os.path.dirname(dst), exist_ok=True)   # a removed folder
             shutil.copy2(src, dst)
             restored += 1
         except OSError as exc:
@@ -522,6 +527,29 @@ def scan_items(project_dir, include_standard=False):
                              "source": raw, "status": mcat,
                              "key": ("model", rel, fi, mi),
                              "wanted": _wanted(mcat, include_standard)})
+
+    # 3D models named inside the project's own footprint libraries: a
+    # library footprint pointing outside the project brings that path back
+    # whenever a footprint is (re)placed from it.
+    for nick, path in local_footprint_files(project_dir):
+        rel = os.path.relpath(path, project_dir).replace(os.sep, "/")
+        try:
+            root = sexpr.parse(_read(path))
+        except sexpr.SExprError:
+            continue
+        label = "{}:{}".format(nick, os.path.splitext(os.path.basename(path))[0])
+        for mi, model in enumerate(root.find_all("model")):
+            if not (model.children[1:] and model.children[1].kind == "atom"):
+                continue
+            raw = model.children[1].value
+            if raw.startswith(EMBED_PREFIX):
+                continue        # carried inside the footprint file itself
+            mcat = classify(raw, project_dir)
+            rows.append({"type": "model", "ref": label,
+                         "name": os.path.basename(raw.replace("\\", "/")),
+                         "source": raw, "status": mcat,
+                         "key": ("libmodel", rel, mi),
+                         "wanted": _wanted(mcat, include_standard)})
     return rows
 
 
@@ -546,15 +574,14 @@ def _model_sources(resolved):
 
 
 def _place_model(session, resolved):
-    """Copy a model (and its twins) into packages3D/<*.3dshapes>/ and return
-    (kiprjmod_path, files_copied).
+    """Copy a model (and its twins) into packages3D/ -- flat, never into a
+    subfolder -- and return (kiprjmod_path, files_copied).
 
     Never overwrites: a destination that already holds identical content is
     reused, and one holding different content (the user's own file, or a
     same-named model from another library) gets a _1, _2, ... suffix instead."""
     project_dir = session.project_dir
-    subdir = os.path.basename(os.path.dirname(resolved))
-    parts = [LOCAL_3D_DIRNAME] + ([subdir] if subdir else [])
+    parts = [LOCAL_3D_DIRNAME]
     dest_dir = os.path.join(project_dir, *parts)
     stem, ext = os.path.splitext(os.path.basename(resolved))
     srcs = _model_sources(resolved)
@@ -624,6 +651,41 @@ def localize_models(session, rows):
 
     return {"files_copied": files_copied, "remapped": remapped,
             "unique_sources": len(placed)}
+
+
+def localize_library_models(session, rows):
+    """Copy the 3D models that project-local library footprints name into
+    packages3D/ (the same place, and the same never-overwrite rule, as board
+    models, so a library footprint and the board share one file) and point
+    the footprints at them. `rows` are scan_items() rows keyed 'libmodel'."""
+    project_dir = session.project_dir
+    resolve = make_resolver(project_dir)
+    by_file = {}
+    for r_ in rows:
+        if r_["key"][0] == "libmodel":
+            by_file.setdefault(r_["key"][1], set()).add(r_["key"][2])
+    copied = remapped = 0
+    placed = {}
+    for rel, mis in by_file.items():
+        path = os.path.join(project_dir, rel)
+        text = _read(path)
+        root = sexpr.parse(text)
+        editor = sexpr.Editor(text)
+        for mi, model in enumerate(root.find_all("model")):
+            if mi not in mis or not model.children[1:]:
+                continue
+            atom = model.children[1]
+            resolved = resolve(atom.value)
+            if not os.path.isfile(resolved):
+                continue
+            key = os.path.normcase(os.path.abspath(resolved))
+            if key not in placed:
+                placed[key], n = _place_model(session, resolved)
+                copied += n
+            editor.replace_atom(atom, placed[key], force_quote=True)
+            remapped += 1
+        write_validated(session, path, editor.result())
+    return {"files_copied": copied, "remapped": remapped, "footprints": len(by_file)}
 
 
 # --- embedded 3D models (kicad-embed://) -------------------------------------
@@ -911,16 +973,23 @@ def _step_twin(raw, resolve, embed_names):
     return None
 
 
+def local_footprint_files(project_dir):
+    """[(library nickname, .kicad_mod path)] for the footprints of the
+    project's own (${KIPRJMOD}) footprint libraries."""
+    resolve = make_resolver(project_dir)
+    table = parse_lib_table(os.path.join(project_dir, "fp-lib-table"))
+    out = []
+    for nick, uri in sorted(table.items()):
+        if "${KIPRJMOD}" in uri:
+            out += [(nick, p) for p in sorted(glob.glob(os.path.join(resolve(uri), "*.kicad_mod")))]
+    return out
+
+
 def _model_holders(project_dir):
     """Files whose (model ...) paths the project controls: its boards and the
     footprints of its project-local (${KIPRJMOD}) footprint libraries."""
-    out = sorted(glob.glob(os.path.join(project_dir, "*.kicad_pcb")))
-    resolve = make_resolver(project_dir)
-    table = parse_lib_table(os.path.join(project_dir, "fp-lib-table"))
-    for uri in sorted(set(table.values())):
-        if "${KIPRJMOD}" in uri:
-            out += sorted(glob.glob(os.path.join(resolve(uri), "*.kicad_mod")))
-    return out
+    return (sorted(glob.glob(os.path.join(project_dir, "*.kicad_pcb")))
+            + [p for _n, p in local_footprint_files(project_dir)])
 
 
 def _vrml_swaps(project_dir, path, text, root):
@@ -989,7 +1058,7 @@ def classify_lib(uri, project_dir):
 
 
 def _wanted(cat, include_standard):
-    return cat in ("external", "rebuild") or (cat == "standard" and include_standard)
+    return cat in ("external", "rebuild", "nested") or (cat == "standard" and include_standard)
 
 
 def _footprint_file(project_dir, uri, fpid):
@@ -1580,6 +1649,8 @@ def apply_selection(session, rows):
     result = {}
     syms = [r for r in rows if r["type"] == "symbol"]
     fps = [r for r in rows if r["type"] == "footprint"]
+    libmodels = [r for r in rows if r["type"] == "model" and r["key"][0] == "libmodel"]
+    rows = [r for r in rows if r["key"][0] != "libmodel"]
     models = [r for r in rows if r["type"] == "model" and r["status"] != "embedded"]
     embedded = [r for r in rows if r["type"] == "model" and r["status"] == "embedded"]
     if syms:
@@ -1590,4 +1661,38 @@ def apply_selection(session, rows):
         result["models"] = localize_models(session, models)
     if embedded:
         result["embedded"] = localize_embedded_models(session, embedded)
+    if libmodels:
+        result["library_models"] = localize_library_models(session, libmodels)
+    nested = [r for r in models + libmodels if r["status"] == "nested"]
+    if nested:
+        result["subfolders"] = _drop_unused_nested(session, nested)
     return result
+
+
+def _drop_unused_nested(session, rows):
+    """After models were moved up out of packages3D subfolders: remove the
+    subfolder copies (and their twins) that no model references any more,
+    backing each up so Revert puts it back, then any emptied subfolder."""
+    project_dir = session.project_dir
+    resolve = make_resolver(project_dir)
+    norm = lambda p: os.path.normcase(os.path.abspath(p))  # noqa: E731
+    used = set()
+    for path in _model_holders(project_dir):
+        for m in sexpr.parse(_read(path)).iter_lists():
+            if m.head() == "model" and m.children[1:] and m.children[1].kind == "atom":
+                used.add(norm(resolve(m.children[1].value)))
+    removed, dirs = 0, set()
+    for r_ in rows:
+        for src in _model_sources(resolve(r_["source"])):
+            if os.path.isfile(src) and norm(src) not in used:
+                session.backup(src)
+                os.remove(src)
+                removed += 1
+                dirs.add(os.path.dirname(src))
+    for d in sorted(dirs, key=len, reverse=True):
+        try:
+            if not os.listdir(d):
+                os.rmdir(d)
+        except OSError:
+            pass
+    return {"files_removed": removed}

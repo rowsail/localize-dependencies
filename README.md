@@ -73,7 +73,10 @@ install it, and restart the PCB editor.
 3. Click Localize. External symbols and footprints land in `libs/<name>_local.*`
    (a KiCad 10 folder symbol library is copied as a folder,
    `libs/<name>_local.kicad_symdir`),
-   3D models in `packages3D/`, the `sym-lib-table` and `fp-lib-table` get the new
+   3D models directly in `packages3D/` (never in a subfolder; models already in
+   a `packages3D` subfolder show as *local, in subfolder* and are moved up),
+   3D models named by the project's own footprint libraries too, the
+   `sym-lib-table` and `fp-lib-table` get the new
    entries, and the references are updated, including the schematic symbols'
    Footprint fields, so *Update PCB from Schematic* keeps the local footprints.
 4. Reload the project so KiCad reads the new files: close the Schematic Editor
@@ -132,7 +135,8 @@ Nothing changes until you click Localize, and whatever it changes is copied into
 `.portability/` first. Revert puts every modified file back as it was before the
 first Localize and removes the local copies, however many times you ran it, and
 also after a run that failed part-way. Copies never overwrite an existing file:
-a 3D model that clashes with one already in `packages3D/` gets a `_1` suffix.
+a 3D model that clashes with a different one already in `packages3D/` gets a
+`_1` suffix.
 If you edited a file after localizing, Revert asks before throwing that edit
 away. Since it works on files on disk, get in the habit of saving before you run
 it and reloading after, and keep important projects under version control.
@@ -145,6 +149,7 @@ Each test file runs on its own with `python tests/<file>.py`:
 - `test_embedded.py`: embedded 3D models. Needs `zstandard` or the `zstd` tool.
 - `test_symbols.py`: symbol libraries, single-file and folder (`.kicad_symdir`).
 - `test_step.py`: "Use STEP instead of VRML", and KiCad path variables.
+- `test_models.py`: models in project footprint libraries, flat `packages3D/`.
 - `test_footprints.py`: footprint localization updates the schematic's
   Footprint fields too, including symbols shared by reused sheets, and
   footprints are rebuilt from the board when their library is gone.
