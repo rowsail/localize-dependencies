@@ -129,6 +129,26 @@ KiCad runs the installed copy of the plugin, not this checkout. Run
 `python tools/install_dev.py` to copy `plugins/` there before trying a change
 in KiCad. CI runs all of the above on every push.
 
+## Tools
+
+`tools/onelib.py` collects the symbols a schematic actually uses into one
+project library, `libs/<project>.kicad_symdir` (a KiCad 10 folder library, one
+file per symbol), and points the schematic at it:
+
+```
+python tools/onelib.py <project_dir>                        # plan only
+python tools/onelib.py <project_dir> --apply                # do it
+python tools/onelib.py <project_dir> --apply --remove-old   # and delete the merged local libraries
+```
+
+Symbols come from whichever library `sym-lib-table` names (or, if none has
+them, the schematic's own cached copy). Two different symbols with one name
+are kept apart (`<name>_<library>`). File names are made portable: plain
+ASCII that Windows and macOS accept (`100kΩ 0805` becomes `100kohm 0805`), and
+names that would then differ only in case use `milli` / `MEG` (`100mohm` →
+`100milliohm`, `100Mohm` → `100MEGohm`). Only names change; Value fields don't.
+Close KiCad and commit the project first. `kicad-cli` writes the library.
+
 ## Building the package
 
 Run `python build.py`. It produces `dist/localize-dependencies-<version>.zip` in
