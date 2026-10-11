@@ -30,7 +30,6 @@ import sexpr
 STATE_DIRNAME = ".portability"           # holds backups + manifest
 MANIFEST_NAME = "manifest.json"
 LOCAL_3D_DIRNAME = "packages3D"          # local 3D models (matches KiCad convention)
-LOCAL_EMBED_SUBDIR = "embedded"          # packages3D/embedded/ for extracted models
 LOCAL_FP_SUFFIX = ".pretty"
 TWIN_EXTS = (".step", ".stp", ".wrl")
 EMBED_PREFIX = "kicad-embed://"
@@ -671,13 +670,13 @@ def embedded_file_bytes(file_node):
 
 def _place_embedded(session, names_contents):
     """Write an embedded model and its embedded twins, [(name, bytes), ...] with
-    the referenced model first, into packages3D/embedded/. Returns
+    the referenced model first, into packages3D/. Returns
     ({name: kiprjmod path}, files_written).
 
     Never overwrites, as _place_model: identical content is reused, and a
     destination holding different content gets a _1, _2, ... stem suffix (the
     same suffix for the model and its twins, so they stay paired)."""
-    parts = [LOCAL_3D_DIRNAME, LOCAL_EMBED_SUBDIR]
+    parts = [LOCAL_3D_DIRNAME]
     dest_dir = os.path.join(session.project_dir, *parts)
     stem = os.path.splitext(os.path.basename(names_contents[0][0].replace("\\", "/")))[0]
 
@@ -728,7 +727,7 @@ def _delete_span(editor, text, node):
 
 def localize_embedded_models(session, rows):
     """Extract the selected embedded (kicad-embed://) models, with their
-    embedded twins, into packages3D/embedded/, remap their (model ...) paths
+    embedded twins, into packages3D/, remap their (model ...) paths
     there, and drop the embedded copies nothing references any more."""
     project_dir = session.project_dir
     keys = {r["key"] for r in rows if r["type"] == "model"}

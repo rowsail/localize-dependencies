@@ -61,7 +61,7 @@ def _natural_key(text):
 
 
 def _localizable(row):
-    # "embedded": a kicad-embed:// model, extracted to packages3D/embedded/.
+    # "embedded": a kicad-embed:// model, extracted to packages3D/.
     # Selectable but never ticked by default -- the board is already
     # self-contained with it.
     return row["status"] in ("external", "standard", "embedded")
@@ -341,11 +341,10 @@ class LocalizeDialog(wx.Dialog):
                 r["files_copied"], r["remapped"]))
         if result.get("embedded"):
             r = result["embedded"]
-            parts.append("Embedded 3D models: {} files extracted to {}/{}, "
+            parts.append("Embedded 3D models: {} files extracted to {}/, "
                          "{} references, {} embedded copies removed".format(
                              r["files_extracted"], portability.LOCAL_3D_DIRNAME,
-                             portability.LOCAL_EMBED_SUBDIR, r["remapped"],
-                             r["embeds_removed"]))
+                             r["remapped"], r["embeds_removed"]))
 
         self.refresh()
         self._msg("Localized:\n\n" + "\n".join(parts) +

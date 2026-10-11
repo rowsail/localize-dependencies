@@ -88,8 +88,8 @@ KiCad 9 and later can embed a 3D model in the board file itself
 never ticked by default, because the board already carries them, but you can
 tick them (or click *Embedded 3D models*) to turn them into ordinary files:
 Localize writes each one, with any embedded `.wrl`/`.step` twin, to
-`packages3D/embedded/`, points the footprint at
-`${KIPRJMOD}/packages3D/embedded/NAME`, and removes the embedded copy once no
+`packages3D/`, points the footprint at
+`${KIPRJMOD}/packages3D/NAME`, and removes the embedded copy once no
 footprint uses it. Embedded data is zstd-compressed; the plugin uses the
 `zstandard` package (installed with it) or, failing that, the `zstd` tool.
 

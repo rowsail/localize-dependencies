@@ -1,4 +1,4 @@
-# Embedded 3D models (kicad-embed://): scan, extract into packages3D/embedded/,
+# Embedded 3D models (kicad-embed://): scan, extract into packages3D/,
 # remap, drop the embedded copies nothing uses, and revert exactly. The board
 # is synthetic but its embedded_files block has the real KiCad shape: base64
 # of a zstd stream, written as |...| over several indented lines.
@@ -81,7 +81,7 @@ def _run(proj, rows):
 
 
 def _emb(proj, name):
-    return os.path.join(proj, "packages3D", "embedded", name)
+    return os.path.join(proj, "packages3D", name)
 
 
 def _board(proj):
@@ -111,8 +111,8 @@ def test_extract_all_then_revert():
         assert _bytes(_emb(proj, "M.wrl")) == WRL_M, "twin extracted with its model"
         assert _bytes(_emb(proj, "F.step")) == STEP_F, "footprint-level embed"
         text = _board(proj)
-        assert text.count("${KIPRJMOD}/packages3D/embedded/M.step") == 2
-        assert "${KIPRJMOD}/packages3D/embedded/F.step" in text
+        assert text.count("${KIPRJMOD}/packages3D/M.step") == 2
+        assert "${KIPRJMOD}/packages3D/F.step" in text
         files = portability._embedded_files(sexpr.parse(text))
         assert set(files) == {"Orphan.step", "sheet.pdf"}, \
             "only the extracted entries are dropped"
@@ -133,7 +133,7 @@ def test_shared_embed_stays_while_still_used():
     try:
         _run(proj, _rows(proj, "R1"))
         text = _board(proj)
-        assert "${KIPRJMOD}/packages3D/embedded/M.step" in text
+        assert "${KIPRJMOD}/packages3D/M.step" in text
         assert 'kicad-embed://M.step' in text, "R2 still uses the embedded copy"
         assert "M.step" in portability._embedded_files(sexpr.parse(text))
         _run(proj, _rows(proj, "R2"))
@@ -150,7 +150,7 @@ def test_extract_never_overwrites():
         assert _bytes(_emb(proj, "M.step")) == b"the user's own file"
         assert _bytes(_emb(proj, "M_1.step")) == STEP_M
         assert _bytes(_emb(proj, "M_1.wrl")) == WRL_M, "twin keeps the same suffix"
-        assert "${KIPRJMOD}/packages3D/embedded/M_1.step" in _board(proj)
+        assert "${KIPRJMOD}/packages3D/M_1.step" in _board(proj)
         portability.revert(proj)
         assert _bytes(_emb(proj, "M.step")) == b"the user's own file"
         assert not os.path.exists(_emb(proj, "M_1.step"))
