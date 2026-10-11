@@ -888,7 +888,12 @@ def localize_footprints(session, rows):
     """Copy the selected footprints into ${KIPRJMOD}/libs/<nick>_local.pretty,
     register those libraries in fp-lib-table, and remap the selected footprint
     IDs. Per-item: only the checked footprints move, and both the original and
-    the _local nickname stay valid, so unselected footprints are untouched."""
+    the _local nickname stay valid, so unselected footprints are untouched.
+
+    The schematic symbols' Footprint fields follow (see
+    _sync_schematic_footprints), or the next "Update PCB from Schematic" would
+    swap the footprints straight back to the global library. A footprint whose
+    library file can't be found is left alone."""
     project_dir = session.project_dir
     resolve = make_resolver(project_dir)
     keys = {r["key"] for r in rows if r["type"] == "footprint"}
@@ -902,6 +907,7 @@ def localize_footprints(session, rows):
     entries = {}
     src_dir_cache = {}
     copied = remapped = 0
+    moved = {}          # board reference -> (old fpid, new fpid)
     for rel, kset in by_pcb.items():
         pcb = os.path.join(project_dir, rel)
         text = _read(pcb)
@@ -923,6 +929,8 @@ def localize_footprints(session, rows):
             session.mkdir(local_dir)
             src_file = os.path.join(src_dir_cache[nick], name + ".kicad_mod")
             dst_file = os.path.join(local_dir, name + ".kicad_mod")
+            if not (os.path.isfile(src_file) or os.path.isfile(dst_file)):
+                continue    # nothing to point at: leave this footprint alone
             if os.path.isfile(src_file) and not os.path.isfile(dst_file):
                 session.wrote_new_file(dst_file)
                 shutil.copy2(src_file, dst_file)
@@ -932,10 +940,79 @@ def localize_footprints(session, rows):
             entries[local_nick] = "${{KIPRJMOD}}/{}/{}{}".format(
                 LOCAL_LIB_DIRNAME, local_nick, LOCAL_FP_SUFFIX)
             remapped += 1
+            ref = _prop(fp, "Reference")
+            if ref:
+                moved[ref] = (atom.value, "{}:{}".format(local_nick, name))
         write_validated(session, pcb, editor.result())
 
     add_lib_entries(session, "fp", entries)
-    return {"libraries": len(entries), "files_copied": copied, "remapped": remapped}
+    sch = _sync_schematic_footprints(session, moved)
+    return {"libraries": len(entries), "files_copied": copied, "remapped": remapped,
+            "schematic_fields": sch["updated"], "schematic_skipped": sch["skipped"]}
+
+
+def _symbol_refs(sym):
+    """Every reference designator a placed symbol carries: its Reference field
+    plus one per sheet instance (a symbol in a reused sheet has several)."""
+    refs = set()
+    r = _prop(sym, "Reference")
+    if r:
+        refs.add(r)
+    inst = sym.find("instances")
+    if inst is not None:
+        for lst in inst.iter_lists():
+            if lst.head() == "reference" and lst.children[1:]:
+                refs.add(lst.children[1].value)
+    return refs
+
+
+def _sync_schematic_footprints(session, moved):
+    """Point the schematic symbols of moved footprints at the localized
+    footprint: (property "Footprint" "Lib:X") -> "Lib_local:X". A symbol in a
+    reused sheet has one Footprint field for all its instances, so it changes
+    only when the board now has every one of its references on that same
+    localized footprint (this run or an earlier one); otherwise it is left and
+    counted as skipped."""
+    updated = skipped = 0
+    if not moved:
+        return {"updated": 0, "skipped": 0}
+    on_board = {}       # reference -> footprint id, as the boards are now
+    for pcb in glob.glob(os.path.join(session.project_dir, "*.kicad_pcb")):
+        for fp in sexpr.parse(_read(pcb)).find_all("footprint"):
+            ref = _prop(fp, "Reference")
+            if ref and fp.children[1:] and fp.children[1].kind == "atom":
+                on_board[ref] = fp.children[1].value
+    for sch in sorted(glob.glob(os.path.join(session.project_dir, "*.kicad_sch"))):
+        text = _read(sch)
+        root = sexpr.parse(text)
+        editor = sexpr.Editor(text)
+        touched = False
+        for sym in _symbol_instances(root):
+            refs = _symbol_refs(sym) & set(moved)
+            if not refs:
+                continue
+            field = None
+            for c in sym.children:
+                if (c.kind == "list" and c.head() == "property" and len(c.children) >= 3
+                        and c.children[1].value == "Footprint"):
+                    field = c.children[2]
+            changes = {moved[r] for r in refs}
+            if field is None or len(changes) != 1:
+                skipped += 1
+                continue
+            old, new = changes.pop()
+            if any(on_board.get(x) != new for x in _symbol_refs(sym) if x in on_board):
+                skipped += 1    # a sheet instance still uses another footprint
+                continue
+            if field.value == old:
+                editor.replace_atom(field, new, force_quote=True)
+                updated += 1
+                touched = True
+            elif field.value != new:
+                skipped += 1    # the schematic named some other footprint
+        if touched:
+            write_validated(session, sch, editor.result())
+    return {"updated": updated, "skipped": skipped}
 
 
 def localize_symbols(session, rows):

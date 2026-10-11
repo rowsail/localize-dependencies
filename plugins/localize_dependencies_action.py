@@ -333,8 +333,15 @@ class LocalizeDialog(wx.Dialog):
                 r["libraries"], r["remapped"]))
         if result.get("footprints"):
             r = result["footprints"]
-            parts.append("Footprints: {} libraries, {} files, {} references".format(
-                r["libraries"], r["files_copied"], r["remapped"]))
+            parts.append("Footprints: {} libraries, {} files, {} references, "
+                         "{} schematic footprint fields".format(
+                             r["libraries"], r["files_copied"], r["remapped"],
+                             r.get("schematic_fields", 0)))
+            if r.get("schematic_skipped"):
+                parts.append("  {} schematic symbol(s) left unchanged (shared by "
+                             "sheet instances not all localized, or naming a "
+                             "different footprint): check them before Update PCB "
+                             "from Schematic".format(r["schematic_skipped"]))
         if result.get("models"):
             r = result["models"]
             parts.append("3D models: {} files, {} references".format(

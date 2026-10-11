@@ -74,7 +74,8 @@ install it, and restart the PCB editor.
    (a KiCad 10 folder symbol library is copied as a folder,
    `libs/<name>_local.kicad_symdir`),
    3D models in `packages3D/`, the `sym-lib-table` and `fp-lib-table` get the new
-   entries, and the references are updated.
+   entries, and the references are updated, including the schematic symbols'
+   Footprint fields, so *Update PCB from Schematic* keeps the local footprints.
 4. Reload the project so KiCad reads the new files: close the Schematic Editor
    and PCB Editor **without saving**, then reopen the project (double-click the
    schematic/board in the project manager, or use File > Open Recent). KiCad has
@@ -115,6 +116,8 @@ Each test file runs on its own with `python tests/<file>.py`:
 - `test_safety.py` and `test_versions.py`: the engine, pure Python.
 - `test_embedded.py`: embedded 3D models. Needs `zstandard` or the `zstd` tool.
 - `test_symbols.py`: symbol libraries, single-file and folder (`.kicad_symdir`).
+- `test_footprints.py`: footprint localization updates the schematic's
+  Footprint fields too, including symbols shared by reused sheets.
 - `test_dialog.py`: the dialog's prompts. Needs wx and kipy, for example the
   plugin's own KiCad venv.
 - `test_kicad_projects.py`: localizes KiCad's demo projects, then checks with
