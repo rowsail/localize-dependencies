@@ -218,6 +218,42 @@ def test_flip_text_box_angle_and_dimension_height():
     assert "mirror" not in dim and '(layer "F.Fab")' in dim, dim
 
 
+def test_left_right_flip_is_top_bottom_turned_180():
+    import sexpr
+    board = ('(kicad_pcb (version 20260206)\n\t(footprint "Lib:L" (layer "B.Cu") (at 0 0)\n'
+             '\t\t(property "Reference" "L1" (at 1 -2 0) (layer "B.SilkS")'
+             ' (effects (font (size 1 1)) (justify mirror)))\n'
+             '\t\t(fp_line (start 1 -0.5) (end 3 -0.5) (layer "B.SilkS"))\n'
+             '\t\t(pad "1" smd rect (at 2 0.5 0) (size 1 2) (layers "B.Cu"))\n'
+             '\t\t(model "x.step" (offset (xyz 0.5 0.25 0)) (rotate (xyz 0 0 90)))\n\t)\n)\n')
+    fp = sexpr.parse(board).find_all("footprint")[0]
+    tb = " ".join(portability.rebuild_footprint(board, fp, "20260206").split())
+    lr = " ".join(portability.rebuild_footprint(board, fp, "20260206", flip="left_right").split())
+    assert '(property "Reference" "REF**" (at 1 2 180)' in tb and "(start 1 0.5) (end 3 0.5)" in tb
+    assert '(property "Reference" "REF**" (at -1 -2)' in lr, \
+        "top-bottom result (1, 2, 180) turned: (-1, -2), angle 180 + 180 = 0"
+    assert "(start -1 -0.5) (end -3 -0.5)" in lr
+    assert '(pad "1" smd rect (at -2 0.5 180)' in lr, "pad turned with the footprint"
+    assert "(offset (xyz -0.5 -0.25 0))" in lr and "(rotate (xyz 0 0 -90))" in lr, \
+        "the 3D model turns too"
+
+
+def test_flip_direction_follows_kicad_setting():
+    import json
+    import tempfile
+    d = tempfile.mkdtemp()
+    saved = portability._config_dirs
+    try:
+        portability._config_dirs = lambda: [d]
+        assert portability.flip_direction() == "top_bottom", "no config: KiCad's default"
+        with open(os.path.join(d, "pcbnew.json"), "w") as fh:
+            json.dump({"editing": {"flip_left_right": True}}, fh)
+        assert portability.flip_direction() == "left_right"
+    finally:
+        portability._config_dirs = saved
+        shutil.rmtree(d)
+
+
 BACK_FP = """(kicad_pcb (version 20260206)
 \t(footprint "Lib:Q"
 \t\t(layer "B.Cu")

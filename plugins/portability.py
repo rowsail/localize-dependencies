@@ -922,6 +922,12 @@ def _fmt(v):
     return "0" if s in ("-0", "") else s
 
 
+def _half_turn(a):
+    """a + 180 degrees, normalised to (-180, 180]."""
+    a = (a + 360) % 360 - 180
+    return 180.0 if a == -180 else a
+
+
 def _flip_layer(name):
     if name.startswith("B."):
         return "F." + name[2:]
@@ -933,7 +939,24 @@ def _flip_layer(name):
 _KEEP_FIELDS = ("Reference", "Value", "Datasheet", "Description")
 
 
-def rebuild_footprint(text, fp, version, board_embeds=None, instance_fields=False):
+def flip_direction():
+    """KiCad's flip direction for the user, as its own footprint export uses
+    it: "left_right" when pcbnew's editing.flip_left_right is set in the
+    newest KiCad config, else "top_bottom" (KiCad's default)."""
+    for d in _config_dirs():
+        path = os.path.join(d, "pcbnew.json")
+        if os.path.isfile(path):
+            try:
+                with open(path, "r", encoding="utf-8") as fh:
+                    cfg = json.load(fh)
+                return "left_right" if cfg.get("editing", {}).get("flip_left_right") else "top_bottom"
+            except (OSError, ValueError):
+                return "top_bottom"
+    return "top_bottom"
+
+
+def rebuild_footprint(text, fp, version, board_embeds=None, instance_fields=False,
+                      flip="top_bottom"):
     """Library .kicad_mod text for the placed footprint `fp` (a list node of
     the board `text`). `board_embeds` ({name: file node}) supplies embedded
     3D models the footprint uses, copied into the footprint's own block.
@@ -945,7 +968,17 @@ def rebuild_footprint(text, fp, version, board_embeds=None, instance_fields=Fals
     the schematic, and a library footprint carrying one instance's part
     number leaks it into every other part using that footprint.
     instance_fields=True keeps the instance's fields, as KiCad's "Export
-    Footprints to Library" does."""
+    Footprints to Library" does.
+
+    flip is the direction a back-side footprint is flipped back in, as in
+    KiCad's settings (see flip_direction()). A left-right flip is a
+    top-bottom flip plus a 180 degree turn (FOOTPRINT::Flip), so the result
+    is the top-bottom one turned 180 degrees as a rigid whole: positions
+    (-x, -y), absolute and text-box angles +180, 3D model offset (-x, -y) and
+    z rotation +180; pad internals (chamfers, drill offset, primitives) stay.
+    KiCad's own export does this turn after resetting the orientation and so
+    loses it (pads and texts turn in place, the outline doesn't); this
+    recovers the footprint a left-right flip was made from instead."""
     # Work on the footprint's own text: edits on the whole board text would
     # cost board-size per edit (minutes per footprint on a 70 MB board).
     board_text = text
@@ -963,12 +996,21 @@ def rebuild_footprint(text, fp, version, board_embeds=None, instance_fields=Fals
         coordinates, unlike every other child:
         absolute = position + R(orientation) . local."""
         ax, ay = x - px, y - py
-        return ax * cos_t - ay * sin_t, ax * sin_t + ay * cos_t
+        lx, ly = ax * cos_t - ay * sin_t, ax * sin_t + ay * cos_t
+        if back:
+            ly = -ly
+            if turn:
+                lx, ly = -lx, -ly
+        return lx, ly
+
+    turn = back and flip == "left_right"
 
     def angle(a, kind):
         a -= orient
         if back:
             a = (180 - a) if kind == "text" else -a
+            if turn:
+                a += 180
         a = (a + 180) % 360 - 180
         return 180.0 if a == -180 else a
 
@@ -1029,9 +1071,13 @@ def rebuild_footprint(text, fp, version, board_embeds=None, instance_fields=Fals
                 if ctx == "zone":
                     lx, ly = zone_local(float(c.children[1].value), float(c.children[2].value))
                     ed.replace_atom(c.children[1], _fmt(lx))
-                    ed.replace_atom(c.children[2], _fmt(-ly if back else ly))
+                    ed.replace_atom(c.children[2], _fmt(ly))
                 elif back:
-                    ed.replace_atom(c.children[2], _fmt(-float(c.children[2].value)))
+                    if turn and ctx != "pad-primitive":
+                        # top-bottom mirror (y) then the 180 degree turn (x, y)
+                        ed.replace_atom(c.children[1], _fmt(-float(c.children[1].value)))
+                    else:
+                        ed.replace_atom(c.children[2], _fmt(-float(c.children[2].value)))
                 if h == "at" and ctx in ("text", "pad"):
                     if len(c.children) >= 4 and _NUM.match(c.children[3].value or ""):
                         a = angle(float(c.children[3].value), ctx)
@@ -1067,6 +1113,15 @@ def rebuild_footprint(text, fp, version, board_embeds=None, instance_fields=Fals
             if back and h == "justify":
                 continue        # handled at the text node, below
             if h == "model":
+                if turn:    # the 3D model turns with the footprint
+                    for key, fix in (("offset", lambda v: (-v[0], -v[1], v[2])),
+                                     ("rotate", lambda v: (v[0], v[1], _half_turn(v[2])))):
+                        node = c.find(key)
+                        xyz = node.find("xyz") if node is not None else None
+                        if xyz is not None and len(xyz.children) >= 4:
+                            new = fix([float(a_.value) for a_ in xyz.children[1:4]])
+                            for a_, v in zip(xyz.children[1:4], new):
+                                ed.replace_atom(a_, _fmt(v))
                 continue
             if back and h in ("property", "fp_text", "fp_text_box", "gr_text"):
                 _flip_mirror(c)
@@ -1074,6 +1129,7 @@ def rebuild_footprint(text, fp, version, board_embeds=None, instance_fields=Fals
                 # a text box's angle is relative to the footprint: flip only
                 ang = c.find("angle")
                 a = (180 - float(ang.children[1].value)) if ang is not None else 180.0
+                a += 180 if turn else 0
                 a = (a + 180) % 360 - 180
                 a = 180.0 if a == -180 else a
                 if ang is not None and not a:
@@ -1181,6 +1237,7 @@ def localize_footprints(session, rows):
     entries = {}
     src_dir_cache = {}   # nick -> (resolved library dir, inside the project?)
     restored = set()     # footprint ids rebuilt into their own project library
+    flip = flip_direction()
     copied = remapped = rebuilt = 0
     moved = {}          # board reference -> (old fpid, new fpid)
     for rel, kset in by_pcb.items():
@@ -1211,7 +1268,8 @@ def localize_footprints(session, rows):
                 if not os.path.isfile(src_file) and atom.value not in restored:
                     session.mkdir(src_dir)
                     _write_rebuilt(session, src_file,
-                                   rebuild_footprint(text, best[atom.value], version, board_embeds))
+                                   rebuild_footprint(text, best[atom.value], version, board_embeds,
+                                                     flip=flip))
                     restored.add(atom.value)
                     rebuilt += 1
                 continue
@@ -1223,7 +1281,8 @@ def localize_footprints(session, rows):
             if not (os.path.isfile(src_file) or os.path.isfile(dst_file)):
                 # library file gone: rebuild it from the board's copy
                 _write_rebuilt(session, dst_file,
-                               rebuild_footprint(text, best[atom.value], version, board_embeds))
+                               rebuild_footprint(text, best[atom.value], version, board_embeds,
+                                                     flip=flip))
                 rebuilt += 1
             elif os.path.isfile(src_file) and not os.path.isfile(dst_file):
                 session.wrote_new_file(dst_file)

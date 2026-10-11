@@ -1,6 +1,6 @@
 """Check portability.rebuild_footprint against KiCad itself on a real board.
 
-    PYTHONPATH=<dir with KiCad's pcbnew.py> python tools/verify_rebuild.py board.kicad_pcb
+    PYTHONPATH=<dir with KiCad's pcbnew.py> python tools/verify_rebuild.py board.kicad_pcb [--flip left_right]
 
 For every footprint on the board, KiCad's own library save (what "Export
 Footprints to Library" uses) writes the reference .kicad_mod, and the
@@ -15,7 +15,10 @@ all three (rebuild_footprint keeps them when instance_fields=True). Files are
 compared structurally, so line wrapping doesn't matter. The reference undoes
 rotation and side, then moves the footprint to the origin, so the children
 KiCad keeps in board coordinates (zones, points, dimensions) come out
-local: KiCad's own export gets those wrong on rotated footprints. Two spellings are treated as equal: text angles that differ by 360 (KiCad
+local: KiCad's own export gets those wrong on rotated footprints. With
+--flip left_right the reference is the top-bottom one with every child
+turned 180 degrees about the origin (and the 3D model with it), which is
+what rebuild_footprint produces for that setting. Two spellings are treated as equal: text angles that differ by 360 (KiCad
 writes -90 or 270 depending on the path), and "*.Cu" on a through-hole pad
 versus the board's own copper layers listed out.
 
@@ -40,6 +43,7 @@ import sexpr  # noqa: E402
 def main():
     import pcbnew
     board_path = os.path.abspath(sys.argv[1])
+    flip = sys.argv[3] if len(sys.argv) > 3 and sys.argv[2] == "--flip" else "top_bottom"
     work = tempfile.mkdtemp(prefix="verify_rebuild-")
     cli = os.environ.get("KICAD_CLI") or shutil.which("kicad-cli") or "kicad-cli"
     try:
@@ -57,9 +61,33 @@ def main():
             # footprints. FootprintSave then has nothing left to change.
             pos = cp.GetPosition()
             cp.SetOrientation(pcbnew.EDA_ANGLE(0, pcbnew.DEGREES_T))
-            if cp.GetLayer() != pcbnew.F_Cu:
+            back = cp.GetLayer() != pcbnew.F_Cu
+            if back:
                 cp.Flip(pos, pcbnew.FLIP_DIRECTION_TOP_BOTTOM)
             cp.SetPosition(pcbnew.VECTOR2I(0, 0))   # zones, points, dimensions follow
+            if back and flip == "left_right":
+                # the 180 degree turn of a left-right flip, baked into every
+                # child (FootprintSave would undo a turn of the footprint)
+                half, origin = pcbnew.EDA_ANGLE(180, pcbnew.DEGREES_T), pcbnew.VECTOR2I(0, 0)
+                items = (list(cp.Pads()) + list(cp.GraphicalItems()) + list(cp.Zones())
+                         + list(cp.GetFields()))
+                for item in items:
+                    item.Rotate(origin, half)
+                models = []
+                for m in cp.Models():
+                    n = pcbnew.FP_3DMODEL()
+                    n.m_Filename, n.m_Show, n.m_Opacity = m.m_Filename, m.m_Show, m.m_Opacity
+                    n.m_Scale.x, n.m_Scale.y, n.m_Scale.z = m.m_Scale.x, m.m_Scale.y, m.m_Scale.z
+                    # (+ 0.0 so that a zero offset stays 0, not -0)
+                    n.m_Offset.x, n.m_Offset.y = -m.m_Offset.x + 0.0, -m.m_Offset.y + 0.0
+                    n.m_Offset.z = m.m_Offset.z
+                    z = (m.m_Rotation.z + 180 + 180) % 360 - 180
+                    n.m_Rotation.x, n.m_Rotation.y = m.m_Rotation.x, m.m_Rotation.y
+                    n.m_Rotation.z = 180.0 if z == -180 else z
+                    models.append(n)
+                cp.Models().clear()
+                for n in models:
+                    cp.Add3DModel(n)
             plug.FootprintSave(lib, cp)
 
         # ours, from the board text
@@ -76,7 +104,7 @@ def main():
             os.makedirs(lib)
             with open(os.path.join(lib, name + ".kicad_mod"), "w", encoding="utf-8") as fh:
                 fh.write(portability.rebuild_footprint(text, fp, ver, embeds,
-                                                       instance_fields=True))
+                                                       instance_fields=True, flip=flip))
             at = fp.find("at")
             jobs.append((ref, label, name, fp.find("layer").children[1].value,
                          at.children[3].value if len(at.children) > 3 else "0"))
@@ -97,7 +125,7 @@ def main():
             """The file as one line per list, compared structurally: UUIDs,
             "(locked yes)" and embedded files dropped (see the module notes),
             angles mod 360, through-hole copper layers as "*.Cu", a text box's two
-            corners as an unordered rectangle."""
+            corners as an unordered rectangle, arc midpoints to 1 um, -0 as 0."""
             out = []
 
             def emit(node, depth):
@@ -105,9 +133,14 @@ def main():
                 if h in ("uuid", "embedded_files") or (
                         depth == 1 and h in ("locked", "component_classes")):
                     return
-                atoms = [a.value for a in node.children if a.kind == "atom"]
+                atoms = ["0" if a.value == "-0" else a.value
+                         for a in node.children if a.kind == "atom"]
                 if h == "at" and len(atoms) == 4:
                     atoms[3] = "%g" % (float(atoms[3]) % 360)
+                if h == "mid" and len(atoms) == 3:
+                    # KiCad's Rotate() recomputes arc midpoints from centre and
+                    # angles (nanometre rounding); 1 um is far below any meaning
+                    atoms[1:] = ["%.3f" % float(x) for x in atoms[1:]]
                 if h == "layers":
                     items = atoms[1:]
                     if "F.Cu" in items and "B.Cu" in items:
@@ -148,7 +181,8 @@ def main():
                     print("DIFF {} {} ({} {}):".format(label, name, layer, angle))
                     print("\n".join(list(difflib.unified_diff(a, b, "kicad", "rebuilt", n=1,
                                                               lineterm=""))[:20]))
-        print("{} of {} footprints identical to KiCad's library save".format(len(jobs) - bad, len(jobs)))
+        print("{} of {} footprints identical to KiCad's library save ({} flip)".format(
+            len(jobs) - bad, len(jobs), flip.replace("_", "-")))
         sys.exit(1 if bad else 0)
     finally:
         shutil.rmtree(work, ignore_errors=True)

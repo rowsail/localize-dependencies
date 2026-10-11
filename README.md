@@ -96,7 +96,11 @@ already a project library, the file is put back where it belongs and nothing
 is remapped. The rebuilt footprint is a clean library footprint: Value is its
 name and part-number fields (LCSC, MPN, ...) are left out, so one placed
 part's numbers can't leak into every other part using that footprint. The
-board's 3D model paths (and any embedded model) come along.
+board's 3D model paths (and any embedded model) come along. Back-side parts are
+flipped back the way KiCad is set to flip (*Preferences > PCB Editor >
+Editing Options*, "flip left/right"); with left/right, the result is turned
+180° as a whole, 3D model included, which recovers the footprint a left/right
+flip was made from (KiCad's own export loses that turn).
 
 ### Embedded 3D models
 
@@ -134,7 +138,8 @@ Each test file runs on its own with `python tests/<file>.py`:
   Footprint fields too, including symbols shared by reused sheets, and
   footprints are rebuilt from the board when their library is gone.
 - `tools/verify_rebuild.py <board>`: checks the rebuild against KiCad's own
-  library save, footprint by footprint. Needs KiCad's `pcbnew` Python module.
+  library save, footprint by footprint (`--flip left_right` for that setting).
+  Needs KiCad's `pcbnew` Python module.
   `tools/make_feature_board.py` writes a board with the harder cases (text
   boxes, footprint dimensions, net ties, both sides, 30° rotation) to run it on.
 - `test_dialog.py`: the dialog's prompts. Needs wx and kipy, for example the
