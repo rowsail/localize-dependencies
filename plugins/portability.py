@@ -17,9 +17,11 @@ import filecmp
 import glob
 import hashlib
 import json
+import base64
 import os
 import re
 import shutil
+import subprocess
 
 import sexpr
 
@@ -28,8 +30,10 @@ import sexpr
 STATE_DIRNAME = ".portability"           # holds backups + manifest
 MANIFEST_NAME = "manifest.json"
 LOCAL_3D_DIRNAME = "packages3D"          # local 3D models (matches KiCad convention)
+LOCAL_EMBED_SUBDIR = "embedded"          # packages3D/embedded/ for extracted models
 LOCAL_FP_SUFFIX = ".pretty"
 TWIN_EXTS = (".step", ".stp", ".wrl")
+EMBED_PREFIX = "kicad-embed://"
 
 _MODEL_DIR_VARS = (
     "KISYS3DMOD", "KICAD6_3DMODEL_DIR", "KICAD7_3DMODEL_DIR",
@@ -173,7 +177,11 @@ def add_lib_entries(session, kind, entries):
 
 
 def classify(raw, project_dir):
-    """external / standard / local / missing for a raw model path."""
+    """external / standard / local / missing for a raw model path. Embedded
+    (kicad-embed://) models are classified by scan_items, which knows which
+    embedded files the board carries."""
+    if raw.startswith(EMBED_PREFIX):
+        return "missing"
     if "${KIPRJMOD}" in raw:
         return "local"
     resolved = make_resolver(project_dir)(raw)
@@ -442,6 +450,7 @@ def scan_items(project_dir, include_standard=False):
     for pcb in sorted(glob.glob(os.path.join(project_dir, "*.kicad_pcb"))):
         rel = os.path.relpath(pcb, project_dir).replace(os.sep, "/")
         root = sexpr.parse(_read(pcb))
+        board_embeds = _embedded_names(root)
         for fi, fp in enumerate(root.find_all("footprint")):
             if not (fp.children[1:] and fp.children[1].kind == "atom"):
                 continue
@@ -458,7 +467,12 @@ def scan_items(project_dir, include_standard=False):
                 if not (model.children[1:] and model.children[1].kind == "atom"):
                     continue
                 raw = model.children[1].value
-                mcat = classify(raw, project_dir)
+                if raw.startswith(EMBED_PREFIX):
+                    ename = raw[len(EMBED_PREFIX):]
+                    mcat = "embedded" if (ename in _embedded_names(fp)
+                                          or ename in board_embeds) else "missing"
+                else:
+                    mcat = classify(raw, project_dir)
                 rows.append({"type": "model", "ref": ref,
                              "name": os.path.basename(raw.replace("\\", "/")),
                              "source": raw, "status": mcat,
@@ -566,6 +580,198 @@ def localize_models(session, rows):
 
     return {"files_copied": files_copied, "remapped": remapped,
             "unique_sources": len(placed)}
+
+
+# --- embedded 3D models (kicad-embed://) -------------------------------------
+#
+# KiCad 9+ can embed a model in the board: the footprint says
+# (model "kicad-embed://NAME.step") and the file itself sits in an
+# (embedded_files (file (name "NAME.step") (type model) (data |...|) ...)) block,
+# at board level or inside the footprint. The data is base64 of a zstd stream.
+
+ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def _embedded_files(node):
+    """{name: (file node)} for the (embedded_files ...) child of `node`."""
+    out = {}
+    if node is None:
+        return out
+    block = node.find("embedded_files")
+    if block is None:
+        return out
+    for f in block.find_all("file"):
+        name = f.find("name")
+        if name is not None and name.children[1:]:
+            out[name.children[1].value] = f
+    return out
+
+
+def _embedded_names(node):
+    return set(_embedded_files(node))
+
+
+def _zstd_decompress(data):
+    try:
+        import io
+        import zstandard
+        with zstandard.ZstdDecompressor().stream_reader(
+                io.BytesIO(data), read_across_frames=True) as rd:
+            return rd.read()
+    except ImportError:
+        pass
+    try:
+        from compression import zstd   # Python 3.14+
+        return zstd.decompress(data)
+    except ImportError:
+        pass
+    exe = shutil.which("zstd")
+    if exe:
+        return subprocess.run([exe, "-d", "-c", "-q"], input=data,
+                              capture_output=True, check=True).stdout
+    raise RuntimeError("Cannot decompress embedded files: install the Python "
+                       "'zstandard' package or the 'zstd' command-line tool.")
+
+
+def embedded_file_bytes(file_node):
+    """Decoded content of one (file ...) entry of an embedded_files block."""
+    data = file_node.find("data")
+    if data is None or not data.children[1:]:
+        raise ValueError("embedded file has no data")
+    # The base64 text is written as |...| split over several lines, so the
+    # parser sees it as several atoms; join them back up.
+    text = "".join(a.raw for a in data.children[1:] if a.kind == "atom")
+    payload = base64.b64decode(text.strip("|"))
+    return _zstd_decompress(payload) if payload[:4] == ZSTD_MAGIC else payload
+
+
+def _place_embedded(session, names_contents):
+    """Write an embedded model and its embedded twins, [(name, bytes), ...] with
+    the referenced model first, into packages3D/embedded/. Returns
+    ({name: kiprjmod path}, files_written).
+
+    Never overwrites, as _place_model: identical content is reused, and a
+    destination holding different content gets a _1, _2, ... stem suffix (the
+    same suffix for the model and its twins, so they stay paired)."""
+    parts = [LOCAL_3D_DIRNAME, LOCAL_EMBED_SUBDIR]
+    dest_dir = os.path.join(session.project_dir, *parts)
+    stem = os.path.splitext(os.path.basename(names_contents[0][0].replace("\\", "/")))[0]
+
+    def dst_for(name, s):
+        return os.path.join(dest_dir, s + os.path.splitext(name)[1])
+
+    def same(path, content):
+        with open(path, "rb") as fh:
+            return fh.read() == content
+
+    def fits(s):
+        return all(not os.path.exists(dst_for(n, s)) or same(dst_for(n, s), c)
+                   for n, c in names_contents)
+
+    n, new_stem = 0, stem
+    while not fits(new_stem):
+        n += 1
+        new_stem = "{}_{}".format(stem, n)
+
+    session.mkdir(dest_dir)
+    paths, written = {}, 0
+    for name, content in names_contents:
+        dst = dst_for(name, new_stem)
+        paths[name] = "${KIPRJMOD}/" + "/".join(parts + [os.path.basename(dst)])
+        if os.path.exists(dst):   # identical content, reuse it
+            continue
+        session.wrote_new_file(dst)
+        tmp = dst + ".portability-tmp"
+        with open(tmp, "wb") as fh:
+            fh.write(content)
+        os.replace(tmp, dst)
+        session.written(dst)
+        written += 1
+    return paths, written
+
+
+def _delete_span(editor, text, node):
+    """Remove a list node and the whitespace before it on its own line."""
+    start = node.start
+    while start > 0 and text[start - 1] in " \t":
+        start -= 1
+    if start > 0 and text[start - 1] == "\n":
+        start -= 1
+        if start > 0 and text[start - 1] == "\r":
+            start -= 1
+    editor.replace_span(start, node.end, "")
+
+
+def localize_embedded_models(session, rows):
+    """Extract the selected embedded (kicad-embed://) models, with their
+    embedded twins, into packages3D/embedded/, remap their (model ...) paths
+    there, and drop the embedded copies nothing references any more."""
+    project_dir = session.project_dir
+    keys = {r["key"] for r in rows if r["type"] == "model"}
+    if not keys:
+        return {"files_extracted": 0, "remapped": 0, "embeds_removed": 0}
+
+    by_pcb = {}
+    for k in keys:
+        by_pcb.setdefault(k[1], set()).add(k)
+
+    extracted = remapped = removed = 0
+    for rel, kset in by_pcb.items():
+        pcb = os.path.join(project_dir, rel)
+        text = _read(pcb)
+        root = sexpr.parse(text)
+        editor = sexpr.Editor(text)
+        board_files = _embedded_files(root)
+        done = {}           # (owner, name) -> new path
+        still_used = set()  # (owner, name) referenced by a model left embedded
+        for fi, fp in enumerate(root.find_all("footprint")):
+            fp_files = _embedded_files(fp)
+            for mi, model in enumerate(fp.find_all("model")):
+                if not model.children[1:]:
+                    continue
+                atom = model.children[1]
+                if not atom.value.startswith(EMBED_PREFIX):
+                    continue
+                name = atom.value[len(EMBED_PREFIX):]
+                owner = ("fp", fi) if name in fp_files else ("board", 0)
+                files = fp_files if owner[0] == "fp" else board_files
+                if ("model", rel, fi, mi) not in kset or name not in files:
+                    still_used.add((owner, name))
+                    continue
+                if (owner, name) not in done:
+                    stem = os.path.splitext(name)[0]
+                    group = [name] + [o for o in files
+                                      if o != name and os.path.splitext(o)[0] == stem
+                                      and os.path.splitext(o)[1].lower() in TWIN_EXTS
+                                      and (owner, o) not in done]
+                    paths, n = _place_embedded(
+                        session, [(g, embedded_file_bytes(files[g])) for g in group])
+                    for g in group:
+                        done[(owner, g)] = paths[g]
+                    extracted += n
+                editor.replace_atom(atom, done[(owner, name)], force_quote=True)
+                remapped += 1
+
+        # Drop the embedded copies that no model references any more.
+        def prune(owner, node, files):
+            nonlocal removed
+            gone = [n for n in files if (owner, n) in done and (owner, n) not in still_used]
+            if not gone:
+                return
+            if len(gone) == len(files):
+                _delete_span(editor, text, node.find("embedded_files"))
+            else:
+                for n in gone:
+                    _delete_span(editor, text, files[n])
+            removed += len(gone)
+
+        for fi, fp in enumerate(root.find_all("footprint")):
+            prune(("fp", fi), fp, _embedded_files(fp))
+        prune(("board", 0), root, board_files)
+        write_validated(session, pcb, editor.result())
+
+    return {"files_extracted": extracted, "remapped": remapped,
+            "embeds_removed": removed}
 
 
 # --- footprint / symbol library localization ---------------------------------
@@ -731,11 +937,14 @@ def apply_selection(session, rows):
     result = {}
     syms = [r for r in rows if r["type"] == "symbol"]
     fps = [r for r in rows if r["type"] == "footprint"]
-    models = [r for r in rows if r["type"] == "model"]
+    models = [r for r in rows if r["type"] == "model" and r["status"] != "embedded"]
+    embedded = [r for r in rows if r["type"] == "model" and r["status"] == "embedded"]
     if syms:
         result["symbols"] = localize_symbols(session, syms)
     if fps:
         result["footprints"] = localize_footprints(session, fps)
     if models:
         result["models"] = localize_models(session, models)
+    if embedded:
+        result["embedded"] = localize_embedded_models(session, embedded)
     return result

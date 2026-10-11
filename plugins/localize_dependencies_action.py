@@ -32,7 +32,7 @@ COL_TYPE, COL_REF, COL_NAME, COL_SOURCE, COL_STATUS = range(5)
 _COL_TITLES = ("Type", "Reference", "Name", "Source", "Status")
 GREY = wx.Colour(140, 140, 140)
 # Sort order when sorting by status: the localizable rows come first.
-_STATUS_ORDER = {"external": 0, "standard": 1, "missing": 2, "local": 3}
+_STATUS_ORDER = {"external": 0, "standard": 1, "embedded": 2, "missing": 3, "local": 4}
 _TYPE_ORDER = {"symbol": 0, "footprint": 1, "model": 2}
 
 
@@ -61,7 +61,10 @@ def _natural_key(text):
 
 
 def _localizable(row):
-    return row["status"] in ("external", "standard")
+    # "embedded": a kicad-embed:// model, extracted to packages3D/embedded/.
+    # Selectable but never ticked by default -- the board is already
+    # self-contained with it.
+    return row["status"] in ("external", "standard", "embedded")
 
 
 class LocalizeDialog(wx.Dialog):
@@ -107,6 +110,7 @@ class LocalizeDialog(wx.Dialog):
         btn_sym = wx.Button(self, label="All symbols")
         btn_fp = wx.Button(self, label="All footprints")
         btn_mod = wx.Button(self, label="All 3D models")
+        btn_emb = wx.Button(self, label="Embedded 3D models")
         self.btn_run = wx.Button(self, label="Localize")
         self.btn_revert = wx.Button(self, label="Revert")
         btn_close = wx.Button(self, wx.ID_CANCEL, label="Close")
@@ -115,11 +119,12 @@ class LocalizeDialog(wx.Dialog):
         btn_sym.Bind(wx.EVT_BUTTON, lambda e: self._check_type("symbol"))
         btn_fp.Bind(wx.EVT_BUTTON, lambda e: self._check_type("footprint"))
         btn_mod.Bind(wx.EVT_BUTTON, lambda e: self._check_type("model"))
+        btn_emb.Bind(wx.EVT_BUTTON, lambda e: self._check_type("model", "embedded"))
         self.btn_run.Bind(wx.EVT_BUTTON, self.on_run)
         self.btn_revert.Bind(wx.EVT_BUTTON, self.on_revert)
 
         left = wx.BoxSizer(wx.HORIZONTAL)
-        for b in (btn_all, btn_none, btn_sym, btn_fp, btn_mod):
+        for b in (btn_all, btn_none, btn_sym, btn_fp, btn_mod, btn_emb):
             left.Add(b, 0, wx.RIGHT, 6)
         right = wx.BoxSizer(wx.HORIZONTAL)
         right.Add(self.btn_run, 0, wx.RIGHT, 8)
@@ -141,8 +146,8 @@ class LocalizeDialog(wx.Dialog):
         self.apply_sort()
         self.populate()
         self.btn_revert.Enable(portability.has_backup(project_dir))
-        self.SetSize((980, 560))
-        self.SetMinSize((900, 400))
+        self.SetSize((1060, 560))
+        self.SetMinSize((980, 400))
 
     # --- population / sorting ---
 
@@ -168,6 +173,7 @@ class LocalizeDialog(wx.Dialog):
 
     def _status_label(self, row):
         return {"external": "external", "standard": "standard lib",
+                "embedded": "embedded",
                 "local": "already local", "missing": "MISSING"}.get(
                     row["status"], row["status"])
 
@@ -253,11 +259,13 @@ class LocalizeDialog(wx.Dialog):
                     self._checked.discard(row["key"])
         self.populate()
 
-    def _check_type(self, type_key):
-        """Check every localizable row of one type, leaving the rest as they are.
-        Pair with 'Select none' to select only that type."""
+    def _check_type(self, type_key, status=None):
+        """Check every localizable row of one type (and status, if given),
+        leaving the rest as they are. Pair with 'Select none' to select only
+        that type."""
         for row in self.rows:
-            if _localizable(row) and row["type"] == type_key:
+            if (_localizable(row) and row["type"] == type_key
+                    and (status is None or row["status"] == status)):
                 self._checked.add(row["key"])
         self.populate()
 
@@ -324,6 +332,13 @@ class LocalizeDialog(wx.Dialog):
             r = result["models"]
             parts.append("3D models: {} files, {} references".format(
                 r["files_copied"], r["remapped"]))
+        if result.get("embedded"):
+            r = result["embedded"]
+            parts.append("Embedded 3D models: {} files extracted to {}/{}, "
+                         "{} references, {} embedded copies removed".format(
+                             r["files_extracted"], portability.LOCAL_3D_DIRNAME,
+                             portability.LOCAL_EMBED_SUBDIR, r["remapped"],
+                             r["embeds_removed"]))
 
         self.refresh()
         self._msg("Localized:\n\n" + "\n".join(parts) +

@@ -81,6 +81,18 @@ install it, and restart the PCB editor.
    files.
 5. To undo, run the plugin again and hit Revert.
 
+### Embedded 3D models
+
+KiCad 9 and later can embed a 3D model in the board file itself
+(`kicad-embed://NAME.step`). Those rows show the status *embedded*. They are
+never ticked by default, because the board already carries them, but you can
+tick them (or click *Embedded 3D models*) to turn them into ordinary files:
+Localize writes each one, with any embedded `.wrl`/`.step` twin, to
+`packages3D/embedded/`, points the footprint at
+`${KIPRJMOD}/packages3D/embedded/NAME`, and removes the embedded copy once no
+footprint uses it. Embedded data is zstd-compressed; the plugin uses the
+`zstandard` package (installed with it) or, failing that, the `zstd` tool.
+
 ![Summary after a localize run](docs/result.png)
 
 ## Safety
@@ -99,6 +111,7 @@ it and reloading after, and keep important projects under version control.
 Each test file runs on its own with `python tests/<file>.py`:
 
 - `test_safety.py` and `test_versions.py`: the engine, pure Python.
+- `test_embedded.py`: embedded 3D models. Needs `zstandard` or the `zstd` tool.
 - `test_dialog.py`: the dialog's prompts. Needs wx and kipy, for example the
   plugin's own KiCad venv.
 - `test_kicad_projects.py`: localizes KiCad's demo projects, then checks with

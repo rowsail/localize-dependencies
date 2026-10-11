@@ -170,6 +170,10 @@ class Editor:
         rep = quote(new_value) if q else new_value
         self._edits.append((atom.start, atom.end, rep))
 
+    def replace_span(self, start, end, text):
+        """Replace text[start:end] verbatim (used to delete whole nodes)."""
+        self._edits.append((start, end, text))
+
     def result(self):
         out = self.text
         for start, end, rep in sorted(self._edits, key=lambda e: e[0], reverse=True):
