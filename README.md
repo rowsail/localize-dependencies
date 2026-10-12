@@ -68,8 +68,10 @@ install it, and restart the PCB editor.
 
 1. Save the project first (`Ctrl+S`).
 2. Run Localize Dependencies and tick the items you want. By default it checks
-   only the external and third-party dependencies. Tick "Also include standard
-   KiCad libraries" if you want it fully independent of the global libraries.
+   the external and third-party dependencies, plus project-library symbols
+   whose fields no longer match the placed symbols. Tick "Also include
+   standard KiCad libraries" if you want it fully independent of the global
+   libraries.
 3. Click Localize.
    - External symbols and footprints land in `libs/<name>_local.*`. A KiCad 10
      folder symbol library is copied as a folder,
