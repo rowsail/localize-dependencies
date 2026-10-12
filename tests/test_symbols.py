@@ -232,7 +232,8 @@ def test_project_library_out_of_step_is_offered_and_updated():
         s = portability.Session(proj)
         res = portability.apply_selection(s, [r for r in rows if r["wanted"]])
         s.save_manifest(res)
-        assert res["symbol_updates"] == {"libraries": 1, "fields_changed": 4}, res
+        assert res["symbol_updates"] == {"libraries": 1, "fields_changed": 4,
+                                         "schematic_copies": 2}, res
         assert "symbols" not in res, "a project library is updated, not copied"
         assert not os.path.exists(os.path.join(proj, "libs", "Proj_local.kicad_symdir"))
         lib = os.path.join(proj, "libs", "Proj.kicad_symdir")
@@ -247,7 +248,8 @@ def test_project_library_out_of_step_is_offered_and_updated():
                  for sy in sch.find("lib_symbols").find_all("symbol")}
         assert cache["Proj:R330"] == {"Value": "330R 0603", "MPN": "AF0603FR-07330RL",
                                       "LCSC": "C144102"}, cache
-        assert cache["R330_1"] == {"Value": "330R 0603", "LCSC": "C144102"}, \
+        assert cache["R330_1"] == {"Value": "330R 0603", "MPN": "AF0603FR-07330RL",
+                                   "LCSC": "C144102"}, \
             "a renamed cache copy (lib_name) follows its lib_id"
         assert cache["Proj:R"] == {"Value": "R"}
         again = {r["ref"]: r["status"] for r in _sym_rows(proj)}
@@ -255,6 +257,37 @@ def test_project_library_out_of_step_is_offered_and_updated():
         assert portability.revert(proj)["errors"] == []
         assert _bytes(sch_path) == before
         assert "C2933198" in open(os.path.join(lib, "R330.kicad_sym"), encoding="utf-8").read()
+    finally:
+        shutil.rmtree(root)
+
+
+def test_schematic_copy_saved_back_over_an_update_is_offered_and_repaired():
+    """KiCad saved its old lib_symbols copy back over a run: the library
+    matches the placed symbols, but the schematic's copy doesn't."""
+    root, proj = _stale_project()
+    try:
+        sch_path = os.path.join(proj, "top.kicad_sch")
+        stale_sch = _bytes(sch_path)
+        s = portability.Session(proj)
+        s.save_manifest(portability.apply_selection(
+            s, [r for r in _sym_rows(proj) if r["wanted"]]))
+        with open(sch_path, "wb") as fh:     # what KiCad's save did
+            fh.write(stale_sch)
+        st = {r["ref"]: r["status"] for r in _sym_rows(proj)}
+        assert st["R13"] == "update" and st["R55"] == "update", st
+        assert st["Q1"] == "local" and st["R1"] == "local", st
+        s = portability.Session(proj)
+        res = portability.apply_selection(s, [r for r in _sym_rows(proj) if r["wanted"]])
+        s.save_manifest(res)
+        assert res["symbol_updates"]["fields_changed"] == 0, "the library was already right"
+        assert res["symbol_updates"]["schematic_copies"] == 2, res
+        sch = sexpr.parse(open(sch_path, encoding="utf-8").read())
+        cache = {sy.children[1].value: {n: c.children[2].value
+                                        for n, c in portability._fields(sy).items()}
+                 for sy in sch.find("lib_symbols").find_all("symbol")}
+        want = {"Value": "330R 0603", "MPN": "AF0603FR-07330RL", "LCSC": "C144102"}
+        assert cache["Proj:R330"] == want and cache["R330_1"] == want, cache
+        assert {r["status"] for r in _sym_rows(proj)} == {"local"}
     finally:
         shutil.rmtree(root)
 

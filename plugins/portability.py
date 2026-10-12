@@ -1781,11 +1781,45 @@ def _sync_library(session, lib, placed):
     return defs, updates, changed
 
 
-def _sync_cache_entry(editor, text, entry, name, defs, updates):
+def _updated_fields(own, upd):
+    """A definition's own fields once `upd` (from symbol_updates) is applied."""
+    out = {k: v for k, v in own.items() if k not in upd["remove"]}
+    out.update(upd["set"])
+    for k, v in upd["add"].items():
+        out.setdefault(k, v)
+    return out
+
+
+def cache_fix(entry, target):
+    """The update (symbol_updates-style) that makes a schematic lib_symbols
+    entry's fields equal `target`, the library's {field: value} for a symbol
+    with no 'extends' parent; None when they already agree. Reference and
+    ki_* properties are left alone; "~" counts as empty."""
+    have = {n: c.children[2].value for n, c in _fields(entry).items()}
+    upd = {"remove": {n for n in have if n not in target and n not in MANDATORY_FIELDS},
+           "set": {}, "add": {}}
+    for n, v in target.items():
+        if n == "Reference":
+            continue
+        if n in have:
+            if _field_value(have[n]) != _field_value(v):
+                upd["set"][n] = v
+        elif n not in MANDATORY_FIELDS:
+            upd["add"][n] = v
+    return upd if (upd["remove"] or upd["set"] or upd["add"]) else None
+
+
+def _sync_cache_entry(editor, text, entry, name, defs, updates, exact=False):
     """Make one schematic lib_symbols entry follow its library's updates.
     The entry is flattened: a removed field goes with the definition in the
     extends chain that provides it; values are only set or added where the
-    definition has no parent (and so equals the entry)."""
+    definition has no parent (and so equals the entry). With `exact`, such
+    an entry is made equal to the updated library symbol outright, which
+    also repairs a copy KiCad wrote back over an earlier update."""
+    if exact and name in defs and defs[name][1] is None:
+        target = _updated_fields(defs[name][0], updates.get(name, {"remove": set(), "set": {}, "add": {}}))
+        upd = cache_fix(entry, target)
+        return apply_symbol_update(editor, text, entry, upd) if upd else 0
     udefs = {n: (set(f) - set(MANDATORY_FIELDS), p) for n, (f, p) in defs.items()}
     drops = {n: u["remove"] for n, u in updates.items()}
     remove = cache_drops(name, user_fields(entry), udefs, drops)
@@ -1807,10 +1841,13 @@ def _placed_by_library(schematics):
 
 def stale_symbols(project_dir, nicks):
     """lib_ids, among the given library nicknames, whose library definition
-    no longer matches its placed symbols (see symbol_updates)."""
+    no longer matches its placed symbols (see symbol_updates), or whose
+    copy in a schematic's lib_symbols no longer matches the library (KiCad
+    saved its old copy over an update, say)."""
     resolve = make_resolver(project_dir)
     schematics = glob.glob(os.path.join(project_dir, "*.kicad_sch"))
     out = set()
+    libs = {}               # nick -> (defs, updates)
     for nick, placed in _placed_by_library(schematics).items():
         if nick not in nicks:
             continue
@@ -1819,32 +1856,54 @@ def stale_symbols(project_dir, nicks):
         if not (os.path.isfile(path) or os.path.isdir(path)):
             continue
         defs, _parsed = library_definitions(path)
-        for name, upd in symbol_updates(defs, placed).items():
+        updates = symbol_updates(defs, placed)
+        libs[nick] = (defs, updates)
+        for name in updates:
             if name in placed:
                 out.add("{}:{}".format(nick, name))
             else:   # a parent losing a field: flag the symbols that extend it
                 out.update("{}:{}".format(nick, n) for n in placed
                            if defs.get(n, ({}, None))[1] == name)
+    for sch in schematics:
+        root = sexpr.parse(_read(sch))
+        alias = _lib_name_aliases(root)
+        ls = root.find("lib_symbols")
+        for entry in (ls.find_all("symbol") if ls else []):
+            if not entry.children[1:]:
+                continue
+            lid = alias.get(entry.children[1].value, entry.children[1].value)
+            nick, _, name = lid.partition(":")
+            if nick not in libs or lid in out:
+                continue
+            defs, updates = libs[nick]
+            if name in defs and defs[name][1] is None and cache_fix(
+                    entry, _updated_fields(defs[name][0], updates.get(name, {"remove": set(), "set": {}, "add": {}}))):
+                out.add(lid)
     return out
 
 
-def _sync_schematic_caches(session, schematics, synced, rename=None):
+def _lib_name_aliases(root):
+    """{lib_symbols entry name: lib_id} for placed symbols whose cached copy
+    KiCad renamed: they carry (lib_name "X_1"), an entry with no "nick:"."""
+    alias = {}
+    for sym in _symbol_instances(root):
+        ln = sym.find("lib_name")
+        if ln and ln.children[1:]:
+            alias[ln.children[1].value] = sym.find("lib_id").children[1].value
+    return alias
+
+
+def _sync_schematic_caches(session, schematics, synced, rename=None, exact=False):
     """Apply `synced` ({nick: (defs, updates)}) to every schematic's
     lib_symbols entries; `rename(atom)` may also remap the entry's name.
-    Returns the number of lib_id atoms `rename` changed."""
-    renamed = 0
+    Returns (lib_id atoms `rename` changed, lib_symbols entries changed)."""
+    renamed = entries = 0
     for sch in schematics:
         text = _read(sch)
         root = sexpr.parse(text)
         editor = sexpr.Editor(text)
         touched = False
-        # A placed symbol whose cached copy was renamed carries (lib_name
-        # "X_1"): that entry has no "nick:" and stands for its lib_id.
-        alias = {}
-        for sym in _symbol_instances(root):
-            ln = sym.find("lib_name")
-            if ln and ln.children[1:]:
-                alias[ln.children[1].value] = sym.find("lib_id").children[1].value
+        alias = _lib_name_aliases(root)
         for lst in root.iter_lists():
             head = lst.head()
             if head == "lib_id" and lst.children[1:] and rename:
@@ -1863,11 +1922,13 @@ def _sync_schematic_caches(session, schematics, synced, rename=None):
                     nick, _, name = alias.get(entry, entry).partition(":")
                     if nick in synced:
                         defs, updates = synced[nick]
-                        if _sync_cache_entry(editor, text, child, name, defs, updates):
+                        if _sync_cache_entry(editor, text, child, name, defs, updates,
+                                             exact=exact):
+                            entries += 1
                             touched = True
         if touched:
             write_validated(session, sch, editor.result())
-    return renamed
+    return renamed, entries
 
 
 def update_symbols(session, rows):
@@ -1890,8 +1951,11 @@ def update_symbols(session, rows):
             defs, updates, n = _sync_library(session, path, placed.get(nick, {}))
             synced[nick] = (defs, updates)
             changed += n
-    _sync_schematic_caches(session, schematics, synced)
-    return {"libraries": len(synced), "fields_changed": changed}
+    # Cached copies are made equal to the library, which also repairs those
+    # KiCad saved back over an earlier run.
+    _, entries = _sync_schematic_caches(session, schematics, synced, exact=True)
+    return {"libraries": len(synced), "fields_changed": changed,
+            "schematic_copies": entries}
 
 
 def localize_symbols(session, rows):
@@ -1980,7 +2044,7 @@ def localize_symbols(session, rows):
                             force_quote=True)
         return True
 
-    remapped = _sync_schematic_caches(session, schematics, synced, rename=remap)
+    remapped, _ = _sync_schematic_caches(session, schematics, synced, rename=remap)
 
     add_lib_entries(session, "sym", entries)
     return {"libraries": len(entries), "files_copied": copied, "remapped": remapped,

@@ -355,8 +355,12 @@ class LocalizeDialog(wx.Dialog):
                              "symbols".format(r["fields_changed"]))
         if result.get("symbol_updates"):
             r = result["symbol_updates"]
-            parts.append("Symbols: {} field(s) updated in {} project librar{}".format(
-                r["fields_changed"], r["libraries"], "y" if r["libraries"] == 1 else "ies"))
+            parts.append("Symbols: {} field(s) updated in {} project librar{}, "
+                         "{} schematic symbol cop{} brought in line".format(
+                             r["fields_changed"], r["libraries"],
+                             "y" if r["libraries"] == 1 else "ies",
+                             r.get("schematic_copies", 0),
+                             "y" if r.get("schematic_copies", 0) == 1 else "ies"))
         if result.get("footprints"):
             r = result["footprints"]
             parts.append("Footprints: {} libraries, {} files, {} references, "

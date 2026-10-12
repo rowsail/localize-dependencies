@@ -117,6 +117,13 @@ parent and that nothing placed extends; removals follow the symbol that
 defines the field. External libraries get the same treatment in their new
 local copy. Revert undoes it.
 
+The schematic keeps its own copy of each library symbol. If KiCad saves
+that old copy back over a run (the editors were saved instead of closed
+without saving), the library is right but the schematic's copy isn't, and
+ERC reports *doesn't match copy in library*. Those symbols show as *local,
+fields differ* too, and Localize makes the schematic's copies match the
+library again.
+
 ### Footprints whose library is gone
 
 A board file holds a complete copy of every footprint it places. When a
