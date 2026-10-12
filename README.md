@@ -70,15 +70,17 @@ install it, and restart the PCB editor.
 2. Run Localize Dependencies and tick the items you want. By default it checks
    only the external and third-party dependencies. Tick "Also include standard
    KiCad libraries" if you want it fully independent of the global libraries.
-3. Click Localize. External symbols and footprints land in `libs/<name>_local.*`
-   (a KiCad 10 folder symbol library is copied as a folder,
-   `libs/<name>_local.kicad_symdir`),
-   3D models directly in `packages3D/` (never in a subfolder; models already in
-   a `packages3D` subfolder show as *local, in subfolder* and are moved up),
-   3D models named by the project's own footprint libraries too, the
-   `sym-lib-table` and `fp-lib-table` get the new
-   entries, and the references are updated, including the schematic symbols'
-   Footprint fields, so *Update PCB from Schematic* keeps the local footprints.
+3. Click Localize.
+   - External symbols and footprints land in `libs/<name>_local.*`. A KiCad 10
+     folder symbol library is copied as a folder,
+     `libs/<name>_local.kicad_symdir`.
+   - 3D models go directly in `packages3D/`, never in a subfolder. Models
+     already in a `packages3D` subfolder show as *local, in subfolder* and are
+     moved up. Models named by the project's own footprint libraries are
+     included too.
+   - `sym-lib-table` and `fp-lib-table` get the new entries, and every
+     reference is updated, including the schematic symbols' Footprint fields,
+     so *Update PCB from Schematic* keeps the local footprints.
 4. Reload the project so KiCad reads the new files: close the Schematic Editor
    and PCB Editor **without saving**, then reopen the project (double-click the
    schematic/board in the project manager, or use File > Open Recent). KiCad has
@@ -127,6 +129,11 @@ Localize writes each one, with any embedded `.wrl`/`.step` twin, to
 footprint uses it. Embedded data is zstd-compressed; the plugin uses the
 `zstandard` package (installed with it) or, failing that, the `zstd` tool.
 
+*Remove unused embedded (N, x MB)* lists how many embedded models no footprint
+references any more (left behind when a footprint is changed or deleted) and
+how much board-file space they take. Clicking it deletes them, after backing
+up each board; Revert brings them back.
+
 ![Summary after a localize run](docs/result.png)
 
 ## Safety
@@ -167,7 +174,8 @@ Each test file runs on its own with `python tests/<file>.py`:
 
 KiCad runs the installed copy of the plugin, not this checkout. Run
 `python tools/install_dev.py` to copy `plugins/` there before trying a change
-in KiCad. CI runs all of the above on every push.
+in KiCad. CI runs all of the above on every push, including
+`verify_rebuild.py` on two of KiCad's demo boards.
 
 ## Tools
 
@@ -180,6 +188,10 @@ python tools/onelib.py <project_dir>                        # plan only
 python tools/onelib.py <project_dir> --apply                # do it
 python tools/onelib.py <project_dir> --apply --remove-old   # and delete the merged local libraries
 ```
+
+`--name` sets the library's nickname (default: the root sheet's name).
+`--root` names the root `.kicad_sch` when the folder holds more than one
+project.
 
 Symbols come from whichever library `sym-lib-table` names (or, if none has
 them, the schematic's own cached copy). Two different symbols with one name
