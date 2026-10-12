@@ -1556,6 +1556,120 @@ def _sync_schematic_footprints(session, moved):
     return {"updated": updated, "skipped": skipped}
 
 
+# Fields every symbol has; never dropped. ki_* properties (keywords,
+# footprint filters) live only in libraries, so instances never carry them.
+MANDATORY_FIELDS = ("Reference", "Value", "Footprint", "Datasheet", "Description")
+
+
+def user_fields(sym):
+    """A symbol's own user fields: {name: property node}, leaving out the
+    mandatory fields and KiCad's internal ki_* properties."""
+    out = {}
+    for c in sym.children:
+        if (c.kind == "list" and c.head() == "property" and c.children[1:]
+                and c.children[1].kind == "atom"):
+            name = c.children[1].value
+            if name not in MANDATORY_FIELDS and not name.startswith("ki_"):
+                out[name] = c
+    return out
+
+
+def placed_fields(sch_paths):
+    """{lib_id: names of the fields its placed symbols carry}, over every
+    placed symbol in the given schematics. Attributes such as (dnp yes) are
+    not fields and play no part."""
+    out = {}
+    for sch in sch_paths:
+        for sym in _symbol_instances(sexpr.parse(_read(sch))):
+            lid = sym.find("lib_id")
+            if lid and lid.children[1:]:
+                names = out.setdefault(lid.children[1].value, set())
+                names.update(c.children[1].value for c in sym.find_all("property")
+                             if c.children[1:])
+    return out
+
+
+def dropped_fields(defs, placed):
+    """The user fields to remove from a library's definitions, {name: set}.
+
+    defs: {name: (own user field names, extends parent or None)}.
+    placed: {name: field names its placed symbols carry} for this library.
+
+    A field deleted from every placed symbol (an LCSC number, say) would come
+    back with the next *Update Symbols from Library*, so the local copy loses
+    it too. A definition keeps whatever any placed symbol using it (directly
+    or through 'extends') still has; definitions nothing placed uses are left
+    alone."""
+    keep = {}
+    for name, fields in placed.items():
+        seen = set()
+        while name in defs and name not in seen:
+            seen.add(name)
+            keep.setdefault(name, set()).update(fields)
+            name = defs[name][1]
+    return {n: defs[n][0] - k for n, k in keep.items() if defs[n][0] - k}
+
+
+def cache_drops(name, cached_fields, defs, drops):
+    """Of the user fields in the schematic's flattened lib_symbols copy of
+    `name`, those that go: each follows the definition in the extends chain
+    that provides it, so the cache stays equal to the library."""
+    out, chain, n = set(), [], name
+    while n in defs and n not in chain:
+        chain.append(n)
+        n = defs[n][1]
+    for f in cached_fields:
+        owner = next((d for d in chain if f in defs[d][0]), None)
+        if owner is not None and f in drops.get(owner, ()):
+            out.add(f)
+    return out
+
+
+def drop_properties(text, sym, names):
+    """`text` with the named user fields of `sym` (parsed from it) removed."""
+    editor = sexpr.Editor(text)
+    for name, node in user_fields(sym).items():
+        if name in names:
+            _delete_span(editor, text, node)
+    return editor.result()
+
+
+def _prune_library_fields(session, lib, placed):
+    """Drop, from the local library copy `lib` (a .kicad_sym file or folder),
+    the user fields no placed symbol carries any more. `placed` is
+    {symbol name: fields}. Returns (defs, drops, fields removed)."""
+    files = ([os.path.join(lib, f) for f in sorted(os.listdir(lib))
+              if f.lower().endswith(".kicad_sym")] if os.path.isdir(lib) else [lib])
+    parsed, defs = [], {}
+    for f in files:
+        text = _read(f)
+        try:
+            root = sexpr.parse(text)
+        except sexpr.SExprError:
+            continue
+        parsed.append((f, text, root))
+        for s in root.find_all("symbol"):
+            if s.children[1:] and s.children[1].kind == "atom":
+                ext = s.find("extends")
+                defs[s.children[1].value] = (
+                    set(user_fields(s)),
+                    ext.children[1].value if ext and ext.children[1:] else None)
+    drops = dropped_fields(defs, placed)
+    removed = 0
+    for f, text, root in parsed:
+        editor = sexpr.Editor(text)
+        for s in root.find_all("symbol"):
+            gone = drops.get(s.children[1].value if s.children[1:] else None, ())
+            for name, node in user_fields(s).items():
+                if name in gone:
+                    _delete_span(editor, text, node)
+                    removed += 1
+        new = editor.result()
+        if new != text:
+            write_validated(session, f, new)
+    return defs, drops, removed
+
+
 def localize_symbols(session, rows):
     """Localize the libraries of the selected symbols. `rows` are the selected
     scan_items() rows of type 'symbol'.
@@ -1591,6 +1705,7 @@ def localize_symbols(session, rows):
         return {"libraries": 0, "files_copied": 0, "remapped": 0}
 
     entries = {}
+    local_libs = {}         # nick -> the local copy
     copied = 0
     for nick, sfile in src_file.items():
         local_nick = nick + LOCAL_SUFFIX
@@ -1618,9 +1733,24 @@ def localize_symbols(session, rows):
                 session.written(local_lib)
                 copied += 1
         entries[local_nick] = "${{KIPRJMOD}}/{}/{}".format(LOCAL_LIB_DIRNAME, local_name)
+        local_libs[nick] = local_lib
+
+    # Fields deleted from every placed symbol leave the local copy as well.
+    schematics = glob.glob(os.path.join(project_dir, "*.kicad_sch"))
+    by_lib = {}
+    for lid, fields in placed_fields(schematics).items():
+        if ":" in lid:
+            nick, name = lid.split(":", 1)
+            by_lib.setdefault(nick, {})[name] = fields
+    pruned = {}             # nick -> (defs, drops)
+    fields_removed = 0
+    for nick, lib in local_libs.items():
+        defs, drops, n = _prune_library_fields(session, lib, by_lib.get(nick, {}))
+        pruned[nick] = (defs, drops)
+        fields_removed += n
 
     remapped = 0
-    for sch in glob.glob(os.path.join(project_dir, "*.kicad_sch")):
+    for sch in schematics:
         text = _read(sch)
         root = sexpr.parse(text)
         editor = sexpr.Editor(text)
@@ -1646,11 +1776,20 @@ def localize_symbols(session, rows):
                 for child in lst.children:
                     if child.kind == "list" and child.head() == "symbol" and child.children[1:]:
                         remap(child.children[1])
+                        nick, _, name = child.children[1].value.partition(":")
+                        if nick not in pruned:
+                            continue
+                        defs, drops = pruned[nick]
+                        fields = user_fields(child)
+                        for f in cache_drops(name, fields, defs, drops):
+                            _delete_span(editor, text, fields[f])
+                            touched = True
         if touched:
             write_validated(session, sch, editor.result())
 
     add_lib_entries(session, "sym", entries)
-    return {"libraries": len(entries), "files_copied": copied, "remapped": remapped}
+    return {"libraries": len(entries), "files_copied": copied, "remapped": remapped,
+            "fields_removed": fields_removed}
 
 
 # --- dispatcher --------------------------------------------------------------

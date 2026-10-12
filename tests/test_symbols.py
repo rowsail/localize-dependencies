@@ -15,6 +15,7 @@ sys.path.insert(0, os.path.join(HERE, "..", "plugins"))
 sys.path.insert(0, HERE)
 
 import portability  # noqa: E402
+import sexpr  # noqa: E402
 from test_safety import _bytes, _write  # noqa: E402
 
 LIB_HEAD = '(kicad_symbol_lib (version 20251024) (generator "test")\n'
@@ -116,6 +117,61 @@ def test_missing_library_is_not_remapped():
         assert _bytes(sch_path) == before, "no reference to a copy that doesn't exist"
         table = open(os.path.join(proj, "sym-lib-table"), encoding="utf-8").read()
         assert "Gone_local" not in table
+    finally:
+        shutil.rmtree(root)
+
+
+def _fields_project():
+    """Library 'One': U (LCSC, MPN), parent P (Mfr) with V extending it
+    (LCSC), and W (LCSC) that nothing places. Every placed U and V has had
+    its LCSC field deleted; one U keeps MPN, the other is DNP without it."""
+    root = tempfile.mkdtemp()
+    proj = os.path.join(root, "proj")
+    one = os.path.join(root, "ext", "One.kicad_sym").replace("\\", "/")
+    p = lambda n, v: '(property "{}" "{}")'.format(n, v)  # noqa: E731
+    _write(one, LIB_HEAD +
+           '\t(symbol "U"\n\t\t' + p("Reference", "U") + '\n\t\t' + p("ki_keywords", "k") +
+           '\n\t\t' + p("LCSC", "C1") + '\n\t\t' + p("MPN", "M1") + '\n\t)\n'
+           '\t(symbol "P"\n\t\t' + p("Mfr", "Acme") + '\n\t)\n'
+           '\t(symbol "V"\n\t\t(extends "P")\n\t\t' + p("LCSC", "C2") + '\n\t)\n'
+           '\t(symbol "W"\n\t\t' + p("LCSC", "C3") + '\n\t)\n)\n')
+    _write(os.path.join(proj, "sym-lib-table"),
+           '(sym_lib_table\n\t(version 7)\n'
+           '\t(lib (name "One")(type "KiCad")(uri "{}")(options "")(descr ""))\n)\n'.format(one))
+    _write(os.path.join(proj, "top.kicad_sch"),
+           "(kicad_sch\n\t(lib_symbols\n"
+           '\t\t(symbol "One:U"\n\t\t\t' + p("LCSC", "C1") + '\n\t\t\t' + p("MPN", "M1") + '\n\t\t)\n'
+           '\t\t(symbol "One:V"\n\t\t\t' + p("Mfr", "Acme") + '\n\t\t\t' + p("LCSC", "C2") + '\n\t\t)\n'
+           '\t)\n'
+           '\t(symbol (lib_id "One:U") ' + p("Reference", "U1") + ' ' + p("MPN", "M1") + ')\n'
+           '\t(symbol (lib_id "One:U") (dnp yes) ' + p("Reference", "U2") + ')\n'
+           '\t(symbol (lib_id "One:V") ' + p("Reference", "V1") + ' ' + p("Mfr", "Acme") + ')\n'
+           ")\n")
+    return root, proj
+
+
+def test_fields_deleted_from_placed_symbols_leave_the_library():
+    root, proj = _fields_project()
+    try:
+        sch_path = os.path.join(proj, "top.kicad_sch")
+        before = _bytes(sch_path)
+        s = portability.Session(proj)
+        res = portability.apply_selection(s, _sym_rows(proj))
+        s.save_manifest(res)
+        assert res["symbols"]["fields_removed"] == 2, res
+        lib = sexpr.parse(open(os.path.join(proj, "libs", "One_local.kicad_sym"),
+                               encoding="utf-8").read())
+        got = {sy.children[1].value: sorted(portability.user_fields(sy))
+               for sy in lib.find_all("symbol")}
+        assert got == {"U": ["MPN"], "P": ["Mfr"], "V": [], "W": ["LCSC"]}, got
+        assert '"ki_keywords"' in open(os.path.join(proj, "libs", "One_local.kicad_sym"),
+                                       encoding="utf-8").read()
+        sch = sexpr.parse(open(sch_path, encoding="utf-8").read())
+        cache = {sy.children[1].value: sorted(portability.user_fields(sy))
+                 for sy in sch.find("lib_symbols").find_all("symbol")}
+        assert cache == {"One_local:U": ["MPN"], "One_local:V": ["Mfr"]}, cache
+        assert portability.revert(proj)["errors"] == []
+        assert _bytes(sch_path) == before
     finally:
         shutil.rmtree(root)
 

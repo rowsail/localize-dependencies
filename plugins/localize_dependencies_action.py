@@ -346,6 +346,9 @@ class LocalizeDialog(wx.Dialog):
             r = result["symbols"]
             parts.append("Symbols: {} libraries, {} references".format(
                 r["libraries"], r["remapped"]))
+            if r.get("fields_removed"):
+                parts.append("  {} library field(s) removed that no placed symbol "
+                             "carries any more".format(r["fields_removed"]))
         if result.get("footprints"):
             r = result["footprints"]
             parts.append("Footprints: {} libraries, {} files, {} references, "

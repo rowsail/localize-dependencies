@@ -78,6 +78,13 @@ install it, and restart the PCB editor.
      already in a `packages3D` subfolder show as *local, in subfolder* and are
      moved up. Models named by the project's own footprint libraries are
      included too.
+   - A field you deleted from every placed instance of a symbol (an LCSC
+     number, say) is removed from the local library copy and the
+     schematic's cached copy too, so *Update Symbols from Library* doesn't
+     bring it back. Mandatory fields (Reference, Value, Footprint,
+     Datasheet, Description), KiCad's `ki_*` properties and attributes such
+     as DNP are never touched, and a field any placed instance still has
+     stays.
    - `sym-lib-table` and `fp-lib-table` get the new entries, and every
      reference is updated, including the schematic symbols' Footprint fields,
      so *Update PCB from Schematic* keeps the local footprints.
@@ -154,7 +161,8 @@ Each test file runs on its own with `python tests/<file>.py`:
 
 - `test_safety.py` and `test_versions.py`: the engine, pure Python.
 - `test_embedded.py`: embedded 3D models. Needs `zstandard` or the `zstd` tool.
-- `test_symbols.py`: symbol libraries, single-file and folder (`.kicad_symdir`).
+- `test_symbols.py`: symbol libraries, single-file and folder (`.kicad_symdir`),
+  and fields deleted from placed symbols leaving the local copy.
 - `test_step.py`: "Use STEP instead of VRML", and KiCad path variables.
 - `test_models.py`: models in project footprint libraries, flat `packages3D/`.
 - `test_footprints.py`: footprint localization updates the schematic's
@@ -195,7 +203,8 @@ project.
 
 Symbols come from whichever library `sym-lib-table` names (or, if none has
 them, the schematic's own cached copy). Two different symbols with one name
-are kept apart (`<name>_<library>`). File names are made portable: plain
+are kept apart (`<name>_<library>`). Fields deleted from every placed
+instance are left out, as in Localize. File names are made portable: plain
 ASCII that Windows and macOS accept (`100kΩ 0805` becomes `100kohm 0805`), and
 names that would then differ only in case use `milli` / `MEG` (`100mohm` →
 `100milliohm`, `100Mohm` → `100MEGohm`). Only names change; Value fields don't.

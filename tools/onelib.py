@@ -16,6 +16,10 @@ saved and committed first):
   lib_symbols cache copy.
 - Same name from two libraries: identical -> one symbol; different -> the
   one with fewer placed instances is renamed <name>_<library>.
+- A user field deleted from every placed symbol of a symbol (an LCSC
+  number, say) is left out of the library and the schematic's cached copy,
+  so *Update Symbols from Library* doesn't bring it back. Mandatory fields,
+  ki_* properties and attributes such as DNP are never touched.
 - Names are made portable, since KiCad saves each symbol as <name>.kicad_sym:
   plain ASCII that Windows and macOS accept (Ω -> ohm, ± -> +-, µ -> u,
   ° -> deg, other non-ASCII reduced to ASCII, / \\ : | -> -, ? -> _, * -> x,
@@ -126,6 +130,7 @@ def plan(proj, nick, root):
     sheets = hierarchy(proj, root)
     used = collections.Counter()
     cache = {}
+    placed = portability.placed_fields([os.path.join(proj, f) for f in sheets])
     for f in sheets:
         text = _read(os.path.join(proj, f))
         root = sexpr.parse(text)
@@ -165,6 +170,30 @@ def plan(proj, nick, root):
         else:
             sys.exit("no definition anywhere for {}:{}".format(*k))
 
+    # Fields deleted from every placed symbol are left out of the library
+    # (and the cache), per library, following 'extends'.
+    cache_drop, dropped = {}, {}
+    for n in {k[0] for k in need}:
+        defs = {}
+        for k, (txt, _src) in need.items():
+            if k[0] == n:
+                s = sexpr.parse(txt)
+                ext = s.find("extends")
+                defs[k[1]] = (set(portability.user_fields(s)),
+                              ext.children[1].value if ext else None)
+        drops = portability.dropped_fields(
+            defs, {k[1]: placed.get(":".join(k), set()) for k in used if k[0] == n})
+        for k in list(need):
+            if k[0] != n:
+                continue
+            txt, src = need[k]
+            if drops.get(k[1]):
+                dropped[":".join(k)] = sorted(drops[k[1]])
+                need[k] = (portability.drop_properties(txt, sexpr.parse(txt), drops[k[1]]), src)
+            if k in cache:
+                cache_drop[k] = portability.cache_drops(
+                    k[1], portability.user_fields(sexpr.parse(cache[k])), defs, drops)
+
     newname = {k: k[1] for k in need}
     renamed = {}
     by = collections.defaultdict(list)
@@ -196,10 +225,10 @@ def plan(proj, nick, root):
     for k in need:
         if newname[k] != k[1]:
             renamed[":".join(k)] = newname[k]
-    return sheets, used, need, newname, renamed, lib_paths
+    return sheets, used, need, newname, renamed, lib_paths, cache_drop, dropped
 
 
-def apply(proj, nick, sheets, need, newname, lib_paths, remove_old):
+def apply(proj, nick, sheets, need, newname, lib_paths, remove_old, cache_drop=None):
     folder = os.path.join(proj, "libs", nick + ".kicad_symdir")
     if os.path.exists(folder):
         sys.exit(folder + " already exists")
@@ -240,7 +269,10 @@ def apply(proj, nick, sheets, need, newname, lib_paths, remove_old):
                 k = tuple(s.children[1].value.split(":", 1))
                 if k not in newname:
                     continue
-                nb = text[s.start:s.end].replace(
+                nb = text[s.start:s.end]
+                if cache_drop and cache_drop.get(k):
+                    nb = portability.drop_properties(nb, sexpr.parse(nb), cache_drop[k])
+                nb = nb.replace(
                     '(symbol "{}"'.format(":".join(k)),
                     '(symbol "{}:{}"'.format(nick, newname[k]), 1)
                 if newname[k] != k[1]:
@@ -450,7 +482,7 @@ def main():
             report.update({"written": n, "table_entries_replaced": merged, "removed": removed})
         print(json.dumps(report, indent=1, ensure_ascii=False))
         return
-    sheets, used, need, newname, renamed, lib_paths = plan(proj, nick, root)
+    sheets, used, need, newname, renamed, lib_paths, cache_drop, dropped = plan(proj, nick, root)
     report = {
         "library": "libs/{}.kicad_symdir".format(nick),
         "sheets": sheets,
@@ -458,11 +490,13 @@ def main():
         "symbols": len(set(newname.values())),
         "from_schematic_cache": sorted(":".join(k) for k, v in need.items() if v[1] != "library"),
         "renamed": renamed,
+        "fields_dropped": dropped,
         "outside_hierarchy": sorted(set(os.path.basename(f) for f in glob.glob(
             os.path.join(proj, "*.kicad_sch"))) - set(sheets)),
     }
     if a.apply:
-        n, merged, removed = apply(proj, nick, sheets, need, newname, lib_paths, a.remove_old)
+        n, merged, removed = apply(proj, nick, sheets, need, newname, lib_paths, a.remove_old,
+                                   cache_drop)
         report.update({"written": n, "table_entries_replaced": merged, "removed": removed})
     print(json.dumps(report, indent=1, ensure_ascii=False))
 
