@@ -91,7 +91,9 @@ def _items(v):
 def _kicad_verdict(proj, env, work, tag):
     """What KiCad says about the project: DRC violations (by type and the
     items involved, not the wording, which names libraries), ERC violations
-    by type, and every 3D model the STEP export could not load.
+    by type, and every 3D model the STEP export could not load. Footprints
+    whose library isn't configured at all are counted apart ("no_library"):
+    localizing rebuilds them from the board, so they must be gone after.
 
     Runs on a copy: kicad-cli writes its own files (.kicad_prl) into the
     project, and the Revert check must only see what the plugin did."""
@@ -110,7 +112,12 @@ def _kicad_verdict(proj, env, work, tag):
     cli("pcb", "drc", "--format", "json", "--severity-all",
         "-o", os.path.join(out, "drc.json"), os.path.join(proj, pcb))
     with open(os.path.join(out, "drc.json"), encoding="utf-8") as fh:
-        drc = collections.Counter((v["type"], _items(v)) for v in json.load(fh)["violations"])
+        violations = json.load(fh)["violations"]
+    # A footprint whose library is not configured at all: the plugin rebuilds
+    # it from the board, so these go away after localizing (checked below).
+    no_lib = collections.Counter(_items(v) for v in violations if _missing_library(v))
+    drc = collections.Counter((v["type"], _items(v)) for v in violations
+                              if not _missing_library(v))
 
     cli("sch", "erc", "--format", "json", "--severity-all",
         "-o", os.path.join(out, "erc.json"), os.path.join(proj, sch))
@@ -124,7 +131,12 @@ def _kicad_verdict(proj, env, work, tag):
             os.path.join(proj, pcb))
     missing = collections.Counter(l.strip() for l in (r.stdout + r.stderr).splitlines()
                                   if "Could not add 3D model" in l)
-    return {"drc": drc, "erc": erc, "missing_models": missing}
+    return {"drc": drc, "erc": erc, "missing_models": missing, "no_library": no_lib}
+
+
+def _missing_library(v):
+    return (v["type"] == "lib_footprint_issues"
+            and "does not include the footprint library" in v.get("description", ""))
 
 
 def _check_demo(demo):
@@ -170,7 +182,10 @@ def _check_demo(demo):
             bare["KICAD{}_{}_DIR".format(ver.split(".")[0], v)] = nowhere
         after = _kicad_verdict(proj, bare, work, "after")
 
-        for key in before:
+        # every footprint whose library was missing must now resolve
+        assert not after["no_library"], "{} footprints still without a library: {}".format(
+            demo, sorted(after["no_library"]))
+        for key in ("drc", "erc", "missing_models"):
             assert after[key] == before[key], (
                 "{} {} differs after localize:\n  only before: {}\n  only after:  {}".format(
                     demo, key, list(before[key] - after[key]), list(after[key] - before[key])))

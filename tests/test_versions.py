@@ -31,6 +31,36 @@ def test_install_share_picks_newest():
         shutil.rmtree(root)
 
 
+def test_resolver_uses_the_install_that_has_the_library():
+    """A distribution's KiCad 9 in /usr and a KiCad 10 in /usr/local: the
+    KiCad 10 table names folder libraries (power.kicad_symdir) that only the
+    KiCad 10 install has, whichever install is listed first."""
+    root = tempfile.mkdtemp()
+    real = portability._INSTALL_GLOBS
+    real_vars = portability.kicad_path_vars
+    saved = {k: os.environ.pop(k) for k in list(os.environ)
+             if k.startswith("KICAD") and k.endswith("_DIR")}
+    try:
+        old = os.path.join(root, "usr", "share", "kicad")
+        new = os.path.join(root, "usr", "local", "share", "kicad")
+        os.makedirs(os.path.join(old, "symbols", "power.kicad_sym"))
+        os.makedirs(os.path.join(new, "symbols", "power.kicad_symdir"))
+        portability._INSTALL_GLOBS = (old, new)
+        portability.kicad_path_vars = lambda: {}
+        resolve = portability.make_resolver(root)
+        assert resolve("${KICAD10_SYMBOL_DIR}/power.kicad_symdir") == \
+            os.path.join(new, "symbols", "power.kicad_symdir")
+        assert resolve("${KICAD9_SYMBOL_DIR}/power.kicad_sym") == \
+            os.path.join(old, "symbols", "power.kicad_sym")
+        assert portability.classify_lib("${KICAD10_SYMBOL_DIR}/power.kicad_symdir",
+                                        root) == "standard"
+    finally:
+        portability._INSTALL_GLOBS = real
+        portability.kicad_path_vars = real_vars
+        os.environ.update(saved)
+        shutil.rmtree(root)
+
+
 def test_config_dirs_newest_first():
     root = tempfile.mkdtemp()
     var = "APPDATA" if os.name == "nt" else "HOME"

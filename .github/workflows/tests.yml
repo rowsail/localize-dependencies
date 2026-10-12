@@ -20,11 +20,14 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y xvfb libnotify4 libsdl2-2.0-0 libsm6
 
+      # wxPython's prebuilt wheel, never the PyPI source build (it needs the
+      # GTK development files and half an hour). The wheel host is slow at
+      # times, so retry rather than fall back to compiling.
       - name: Install plugin dependencies
         run: |
-          pip install wxPython==4.2.2 \
+          pip install --only-binary wxPython --retries 10 --timeout 60 wxPython==4.2.2 \
             -f https://extras.wxpython.org/wxPython4/extras/linux/gtk3/ubuntu-24.04/
-          pip install -r plugins/requirements.txt
+          pip install --only-binary wxPython -r plugins/requirements.txt
 
       - name: Run engine and dialog tests
         run: |

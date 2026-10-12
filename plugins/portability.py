@@ -42,6 +42,7 @@ _MODEL_DIR_VARS = (
 _INSTALL_GLOBS = (
     r"C:\Program Files\KiCad\*\share\kicad",
     r"C:\Program Files (x86)\KiCad\*\share\kicad",
+    "/usr/local/share/kicad",
     "/usr/share/kicad",
     "/Applications/KiCad/KiCad.app/Contents/SharedSupport",
 )
@@ -56,12 +57,26 @@ def _version_key(path):
     return (int(m.group(1)), int(m.group(2))) if m else (0, 0)
 
 
-def _install_share():
+def _install_shares():
+    """Every KiCad install's share dir, newest version first (an unversioned
+    path such as /usr/local/share/kicad keeps its _INSTALL_GLOBS order). A
+    machine can have more than one, e.g. a distribution's KiCad 9 in /usr and
+    a KiCad 10 built into /usr/local."""
     hits = []
     for pat in _INSTALL_GLOBS:
-        hits.extend(p for p in glob.glob(pat) if os.path.isdir(p))
-    hits.sort(key=_version_key, reverse=True)
-    return hits[0] if hits else None
+        hits.extend(p for p in glob.glob(pat) if os.path.isdir(p) and p not in hits)
+    hits.sort(key=_version_key, reverse=True)   # stable: keeps glob order on ties
+    return hits
+
+
+def _install_share():
+    shares = _install_shares()
+    return shares[0] if shares else None
+
+
+def _in_install(path):
+    flat = path.replace("\\", "/").lower()
+    return any(s.replace("\\", "/").lower() in flat for s in _install_shares())
 
 
 def kicad_path_vars():
@@ -85,25 +100,17 @@ def make_resolver(project_dir):
     dir vars, and any environment variables, then the user's KiCad path
     variables (kicad_path_vars). Falls back to the KiCad install share dir for
     unset ${KICAD*_{3DMODEL,FOOTPRINT,SYMBOL}_DIR} (common: the plugin runs in
-    a separate process without those set)."""
-    share = _install_share()
+    a separate process without those set). With several installs, the first
+    in which the resolved path exists wins (a KiCad 10 table names
+    .kicad_symdir libraries that a KiCad 9 install doesn't have)."""
     kicad_vars = kicad_path_vars()
     env_model = {v: os.environ[v] for v in _MODEL_DIR_VARS
                  if os.environ.get(v) and os.path.isdir(os.environ[v])}
-    fallbacks = {}   # var-suffix -> dir
-    if share:
-        for sub, suffix in (("3dmodels", "_3DMODEL_DIR"),
-                            ("footprints", "_FOOTPRINT_DIR"),
-                            ("symbols", "_SYMBOL_DIR")):
-            d = os.path.join(share, sub)
-            if os.path.isdir(d):
-                fallbacks[suffix] = d
+    shares = _install_shares()
+    subdirs = (("3dmodels", "_3DMODEL_DIR"), ("footprints", "_FOOTPRINT_DIR"),
+               ("symbols", "_SYMBOL_DIR"))
 
-    def resolve(raw):
-        if not raw:
-            return raw
-        s = re.sub(r"\$\(([^)]+)\)", r"${\1}", raw)   # $(VAR) -> ${VAR}
-
+    def resolve_with(s, share):
         def repl(m):
             name = m.group(1)
             if name == "KIPRJMOD":
@@ -113,13 +120,23 @@ def make_resolver(project_dir):
             val = os.environ.get(name) or kicad_vars.get(name)
             if val:
                 return val
-            for suffix, d in fallbacks.items():
-                if name.endswith(suffix):
-                    return d
+            if share:
+                for sub, suffix in subdirs:
+                    if name.endswith(suffix) and os.path.isdir(os.path.join(share, sub)):
+                        return os.path.join(share, sub)
             return m.group(0)
 
-        s = re.sub(r"\$\{([^}]+)\}", repl, s)
-        return os.path.normpath(s)
+        return os.path.normpath(re.sub(r"\$\{([^}]+)\}", repl, s))
+
+    def resolve(raw):
+        if not raw:
+            return raw
+        s = re.sub(r"\$\(([^)]+)\)", r"${\1}", raw)   # $(VAR) -> ${VAR}
+        candidates = [resolve_with(s, share) for share in shares] or [resolve_with(s, None)]
+        for c in candidates:
+            if os.path.exists(c):
+                return c
+        return candidates[0]
 
     return resolve
 
@@ -207,9 +224,7 @@ def classify(raw, project_dir):
             return "nested" if os.path.isfile(make_resolver(project_dir)(raw)) else "missing"
         return "local"
     resolved = make_resolver(project_dir)(raw)
-    is_std = bool(re.search(r"\$\{KICAD\d*_3DMODEL_DIR\}", raw)) or (
-        _install_share() and _install_share().replace("\\", "/").lower()
-        in resolved.replace("\\", "/").lower())
+    is_std = bool(re.search(r"\$\{KICAD\d*_3DMODEL_DIR\}", raw)) or _in_install(resolved)
     if not os.path.isfile(resolved):
         return "missing"
     return "standard" if is_std else "external"
@@ -1049,9 +1064,7 @@ def classify_lib(uri, project_dir):
     if "${KIPRJMOD}" in uri:
         return "local"
     resolved = make_resolver(project_dir)(uri)
-    share = _install_share()
-    is_std = bool(re.search(r"\$\{KICAD\d*_(FOOTPRINT|SYMBOL)_DIR\}", uri)) or (
-        share and share.replace("\\", "/").lower() in resolved.replace("\\", "/").lower())
+    is_std = bool(re.search(r"\$\{KICAD\d*_(FOOTPRINT|SYMBOL)_DIR\}", uri)) or _in_install(resolved)
     if not os.path.exists(resolved):
         return "missing"
     return "standard" if is_std else "external"
