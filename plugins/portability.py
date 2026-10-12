@@ -493,6 +493,9 @@ def scan_items(project_dir, include_standard=False):
     """
     rows = []
 
+    local_nicks = {nick for nick, uri in parse_lib_table(
+        os.path.join(project_dir, "sym-lib-table")).items() if "${KIPRJMOD}" in uri}
+    stale = stale_symbols(project_dir, local_nicks)
     for sch in sorted(glob.glob(os.path.join(project_dir, "*.kicad_sch"))):
         rel = os.path.relpath(sch, project_dir).replace(os.sep, "/")
         root = sexpr.parse(_read(sch))
@@ -504,6 +507,8 @@ def scan_items(project_dir, include_standard=False):
             nick = libid.split(":", 1)[0] if ":" in libid else ""
             uri = resolve_lib_uri(project_dir, "sym-lib-table", nick) if nick else None
             cat = classify_lib(uri, project_dir) if nick else "local"
+            if cat == "local" and libid in stale:
+                cat = "update"      # project library out of step with the parts
             rows.append({"type": "symbol", "ref": _prop(sym, "Reference") or "?",
                          "name": libid, "source": uri or "", "status": cat,
                          "key": ("symbol", rel, i),
@@ -1070,8 +1075,12 @@ def classify_lib(uri, project_dir):
     return "standard" if is_std else "external"
 
 
+# Statuses ticked by default ("standard" only with the include-standard box).
+DEFAULT_ON = ("external", "rebuild", "nested", "update")
+
+
 def _wanted(cat, include_standard):
-    return cat in ("external", "rebuild", "nested") or (cat == "standard" and include_standard)
+    return cat in DEFAULT_ON or (cat == "standard" and include_standard)
 
 
 def _footprint_file(project_dir, uri, fpid):
@@ -1556,37 +1565,46 @@ def _sync_schematic_footprints(session, moved):
     return {"updated": updated, "skipped": skipped}
 
 
-# Fields every symbol has; never dropped. ki_* properties (keywords,
+# Fields every symbol has; never removed. ki_* properties (keywords,
 # footprint filters) live only in libraries, so instances never carry them.
 MANDATORY_FIELDS = ("Reference", "Value", "Footprint", "Datasheet", "Description")
+
+
+def _fields(sym):
+    """{name: property node} of a symbol's own fields, ki_* left out."""
+    out = {}
+    for c in sym.children:
+        if (c.kind == "list" and c.head() == "property" and c.children[2:]
+                and c.children[1].kind == "atom"
+                and not c.children[1].value.startswith("ki_")):
+            out[c.children[1].value] = c
+    return out
 
 
 def user_fields(sym):
     """A symbol's own user fields: {name: property node}, leaving out the
     mandatory fields and KiCad's internal ki_* properties."""
-    out = {}
-    for c in sym.children:
-        if (c.kind == "list" and c.head() == "property" and c.children[1:]
-                and c.children[1].kind == "atom"):
-            name = c.children[1].value
-            if name not in MANDATORY_FIELDS and not name.startswith("ki_"):
-                out[name] = c
-    return out
+    return {n: c for n, c in _fields(sym).items() if n not in MANDATORY_FIELDS}
 
 
-def placed_fields(sch_paths):
-    """{lib_id: names of the fields its placed symbols carry}, over every
-    placed symbol in the given schematics. Attributes such as (dnp yes) are
-    not fields and play no part."""
+def placed_symbols(sch_paths):
+    """{lib_id: [{field: value} for each placed symbol]} over the given
+    schematics. Attributes such as (dnp yes) are not fields and play no
+    part."""
     out = {}
     for sch in sch_paths:
         for sym in _symbol_instances(sexpr.parse(_read(sch))):
             lid = sym.find("lib_id")
             if lid and lid.children[1:]:
-                names = out.setdefault(lid.children[1].value, set())
-                names.update(c.children[1].value for c in sym.find_all("property")
-                             if c.children[1:])
+                out.setdefault(lid.children[1].value, []).append(
+                    {n: c.children[2].value for n, c in _fields(sym).items()})
     return out
+
+
+def placed_fields(sch_paths):
+    """{lib_id: names of the fields its placed symbols carry}."""
+    return {lid: set().union(*insts)
+            for lid, insts in placed_symbols(sch_paths).items()}
 
 
 def dropped_fields(defs, placed):
@@ -1596,9 +1614,9 @@ def dropped_fields(defs, placed):
     placed: {name: field names its placed symbols carry} for this library.
 
     A field deleted from every placed symbol (an LCSC number, say) would come
-    back with the next *Update Symbols from Library*, so the local copy loses
-    it too. A definition keeps whatever any placed symbol using it (directly
-    or through 'extends') still has; definitions nothing placed uses are left
+    back with the next *Update Symbols from Library*, so the library loses it
+    too. A definition keeps whatever any placed symbol using it (directly or
+    through 'extends') still has; definitions nothing placed uses are left
     alone."""
     keep = {}
     for name, fields in placed.items():
@@ -1625,23 +1643,110 @@ def cache_drops(name, cached_fields, defs, drops):
     return out
 
 
+def _field_value(v):
+    """A field value as KiCad reads it: "~" is its old marker for empty,
+    read as empty in a schematic but literally in a library file."""
+    return "" if v == "~" else v
+
+
+def symbol_updates(lib_defs, placed):
+    """What a library's definitions need so they match their placed symbols.
+
+    lib_defs: {name: ({field: value}, extends parent or None)}, own fields.
+    placed: {name: [{field: value} per placed symbol]} for this library.
+
+    Returns {name: {"remove": set, "set": {field: value}, "add": {field:
+    value}}}, only for definitions that need something:
+    - remove: user fields no placed symbol carries any more (dropped_fields);
+    - set: fields (all but Reference) every placed symbol has, with one value
+      that differs from the library's -- an LCSC number changed on the parts;
+    - add: user fields every placed symbol has, with one value, that the
+      library lacks.
+    A field the placed symbols disagree on (a generic resistor's Value, say)
+    is left as it is. Values are only set or added on a definition that has
+    no 'extends' parent and that no placed symbol extends, so a change never
+    reaches symbols it wasn't made on."""
+    defs = {n: (set(f) - set(MANDATORY_FIELDS), p) for n, (f, p) in lib_defs.items()}
+    drops = dropped_fields(defs, {n: set().union(*i) for n, i in placed.items() if i})
+    parents = set()
+    for n in placed:
+        p = lib_defs.get(n, ({}, None))[1]
+        while p and p in lib_defs and p not in parents:
+            parents.add(p)
+            p = lib_defs[p][1]
+    out = {}
+    for n, (own, parent) in lib_defs.items():
+        upd = {"remove": drops.get(n, set()), "set": {}, "add": {}}
+        insts = placed.get(n)
+        if insts and parent is None and n not in parents:
+            for f in set.intersection(*(set(i) for i in insts)) - {"Reference"}:
+                vals = {_field_value(i[f]) for i in insts}
+                if len(vals) != 1:
+                    continue
+                v = vals.pop()
+                if f in own:
+                    if _field_value(own[f]) != v:
+                        upd["set"][f] = v
+                elif f not in MANDATORY_FIELDS:
+                    upd["add"][f] = v
+        if upd["remove"] or upd["set"] or upd["add"]:
+            out[n] = upd
+    return out
+
+
+def _new_property(text, sym, name, value):
+    """Text for a hidden property, laid out like the symbol's last one, to
+    insert just after it. Returns (offset, text)."""
+    props = sym.find_all("property")
+    last = props[-1] if props else None
+    at = last.end if last else sym.children[1].end
+    line = text.rfind("\n", 0, last.start if last else sym.start) + 1
+    ind = re.match(r"[ \t]*", text[line:]).group(0) + ("" if last else "\t")
+    i2, i3, i4 = ind + "\t", ind + "\t\t", ind + "\t\t\t"
+    return at, ("\n{0}(property {1} {2}\n{3}(at 0 0 0)\n{3}(hide yes)\n{3}(effects\n"
+                "{4}(font\n{5}(size 1.27 1.27)\n{4})\n{3})\n{0})").format(
+                    ind, sexpr.quote(name), sexpr.quote(value), i2, i3, i4)
+
+
+def apply_symbol_update(editor, text, sym, upd, remove=None):
+    """Queue `upd` (one symbol_updates() entry) against `sym` in `editor`.
+    `remove` overrides the fields to delete (for a flattened cache copy).
+    Returns the number of fields changed."""
+    n = 0
+    remove = upd["remove"] if remove is None else remove
+    for name, node in _fields(sym).items():
+        if name in remove and name not in MANDATORY_FIELDS:
+            _delete_span(editor, text, node)
+            n += 1
+        elif name in upd["set"]:
+            editor.replace_atom(node.children[2], upd["set"][name], force_quote=True)
+            n += 1
+    have = set(_fields(sym))
+    for name, value in sorted(upd["add"].items()):
+        if name not in have:
+            at, new = _new_property(text, sym, name, value)
+            editor.replace_span(at, at, new)
+            n += 1
+    return n
+
+
 def drop_properties(text, sym, names):
     """`text` with the named user fields of `sym` (parsed from it) removed."""
     editor = sexpr.Editor(text)
-    for name, node in user_fields(sym).items():
-        if name in names:
-            _delete_span(editor, text, node)
+    apply_symbol_update(editor, text, sym, {"remove": set(names), "set": {}, "add": {}})
     return editor.result()
 
 
-def _prune_library_fields(session, lib, placed):
-    """Drop, from the local library copy `lib` (a .kicad_sym file or folder),
-    the user fields no placed symbol carries any more. `placed` is
-    {symbol name: fields}. Returns (defs, drops, fields removed)."""
-    files = ([os.path.join(lib, f) for f in sorted(os.listdir(lib))
-              if f.lower().endswith(".kicad_sym")] if os.path.isdir(lib) else [lib])
+def _library_files(lib):
+    return ([os.path.join(lib, f) for f in sorted(os.listdir(lib))
+             if f.lower().endswith(".kicad_sym")] if os.path.isdir(lib) else [lib])
+
+
+def library_definitions(lib):
+    """{name: ({field: value}, extends parent)} of a .kicad_sym file or a
+    folder library, plus the parsed files [(path, text, root)]."""
     parsed, defs = [], {}
-    for f in files:
+    for f in _library_files(lib):
         text = _read(f)
         try:
             root = sexpr.parse(text)
@@ -1652,22 +1757,141 @@ def _prune_library_fields(session, lib, placed):
             if s.children[1:] and s.children[1].kind == "atom":
                 ext = s.find("extends")
                 defs[s.children[1].value] = (
-                    set(user_fields(s)),
+                    {n: c.children[2].value for n, c in _fields(s).items()},
                     ext.children[1].value if ext and ext.children[1:] else None)
-    drops = dropped_fields(defs, placed)
-    removed = 0
+    return defs, parsed
+
+
+def _sync_library(session, lib, placed):
+    """Bring library `lib` in line with its placed symbols (symbol_updates).
+    `placed` is {symbol name: [fields per placed symbol]}. Returns
+    (defs, updates, fields changed)."""
+    defs, parsed = library_definitions(lib)
+    updates = symbol_updates(defs, placed)
+    changed = 0
     for f, text, root in parsed:
         editor = sexpr.Editor(text)
         for s in root.find_all("symbol"):
-            gone = drops.get(s.children[1].value if s.children[1:] else None, ())
-            for name, node in user_fields(s).items():
-                if name in gone:
-                    _delete_span(editor, text, node)
-                    removed += 1
+            upd = updates.get(s.children[1].value if s.children[1:] else None)
+            if upd:
+                changed += apply_symbol_update(editor, text, s, upd)
         new = editor.result()
         if new != text:
             write_validated(session, f, new)
-    return defs, drops, removed
+    return defs, updates, changed
+
+
+def _sync_cache_entry(editor, text, entry, name, defs, updates):
+    """Make one schematic lib_symbols entry follow its library's updates.
+    The entry is flattened: a removed field goes with the definition in the
+    extends chain that provides it; values are only set or added where the
+    definition has no parent (and so equals the entry)."""
+    udefs = {n: (set(f) - set(MANDATORY_FIELDS), p) for n, (f, p) in defs.items()}
+    drops = {n: u["remove"] for n, u in updates.items()}
+    remove = cache_drops(name, user_fields(entry), udefs, drops)
+    upd = updates.get(name, {"remove": set(), "set": {}, "add": {}})
+    if name in defs and defs[name][1] is not None:
+        upd = {"remove": set(), "set": {}, "add": {}}
+    return apply_symbol_update(editor, text, entry, upd, remove=remove)
+
+
+def _placed_by_library(schematics):
+    """{nick: {symbol name: [fields per placed symbol]}}."""
+    out = {}
+    for lid, insts in placed_symbols(schematics).items():
+        if ":" in lid:
+            nick, name = lid.split(":", 1)
+            out.setdefault(nick, {})[name] = insts
+    return out
+
+
+def stale_symbols(project_dir, nicks):
+    """lib_ids, among the given library nicknames, whose library definition
+    no longer matches its placed symbols (see symbol_updates)."""
+    resolve = make_resolver(project_dir)
+    schematics = glob.glob(os.path.join(project_dir, "*.kicad_sch"))
+    out = set()
+    for nick, placed in _placed_by_library(schematics).items():
+        if nick not in nicks:
+            continue
+        uri = resolve_lib_uri(project_dir, "sym-lib-table", nick)
+        path = resolve(uri) if uri else ""
+        if not (os.path.isfile(path) or os.path.isdir(path)):
+            continue
+        defs, _parsed = library_definitions(path)
+        for name, upd in symbol_updates(defs, placed).items():
+            if name in placed:
+                out.add("{}:{}".format(nick, name))
+            else:   # a parent losing a field: flag the symbols that extend it
+                out.update("{}:{}".format(nick, n) for n in placed
+                           if defs.get(n, ({}, None))[1] == name)
+    return out
+
+
+def _sync_schematic_caches(session, schematics, synced, rename=None):
+    """Apply `synced` ({nick: (defs, updates)}) to every schematic's
+    lib_symbols entries; `rename(atom)` may also remap the entry's name.
+    Returns the number of lib_id atoms `rename` changed."""
+    renamed = 0
+    for sch in schematics:
+        text = _read(sch)
+        root = sexpr.parse(text)
+        editor = sexpr.Editor(text)
+        touched = False
+        # A placed symbol whose cached copy was renamed carries (lib_name
+        # "X_1"): that entry has no "nick:" and stands for its lib_id.
+        alias = {}
+        for sym in _symbol_instances(root):
+            ln = sym.find("lib_name")
+            if ln and ln.children[1:]:
+                alias[ln.children[1].value] = sym.find("lib_id").children[1].value
+        for lst in root.iter_lists():
+            head = lst.head()
+            if head == "lib_id" and lst.children[1:] and rename:
+                if rename(editor, lst.children[1]):
+                    renamed += 1
+                    touched = True
+            elif head == "lib_symbols":
+                for child in lst.children:
+                    if not (child.kind == "list" and child.head() == "symbol"
+                            and child.children[1:]):
+                        continue
+                    if rename and rename(editor, child.children[1]):
+                        renamed += 1
+                        touched = True
+                    entry = child.children[1].value
+                    nick, _, name = alias.get(entry, entry).partition(":")
+                    if nick in synced:
+                        defs, updates = synced[nick]
+                        if _sync_cache_entry(editor, text, child, name, defs, updates):
+                            touched = True
+        if touched:
+            write_validated(session, sch, editor.result())
+    return renamed
+
+
+def update_symbols(session, rows):
+    """Update project libraries whose symbols no longer match their placed
+    symbols (rows with status 'update'): fields changed, added or deleted on
+    every placed symbol are changed, added or deleted in the library and in
+    the schematics' lib_symbols copies, so *Update Symbols from Library*
+    keeps them."""
+    project_dir = session.project_dir
+    resolve = make_resolver(project_dir)
+    nicks = {r["name"].split(":", 1)[0] for r in rows
+             if r["type"] == "symbol" and ":" in r["name"]}
+    schematics = glob.glob(os.path.join(project_dir, "*.kicad_sch"))
+    placed = _placed_by_library(schematics)
+    synced, changed = {}, 0
+    for nick in sorted(nicks):
+        uri = resolve_lib_uri(project_dir, "sym-lib-table", nick)
+        path = resolve(uri) if uri else ""
+        if os.path.isfile(path) or os.path.isdir(path):
+            defs, updates, n = _sync_library(session, path, placed.get(nick, {}))
+            synced[nick] = (defs, updates)
+            changed += n
+    _sync_schematic_caches(session, schematics, synced)
+    return {"libraries": len(synced), "fields_changed": changed}
 
 
 def localize_symbols(session, rows):
@@ -1735,61 +1959,32 @@ def localize_symbols(session, rows):
         entries[local_nick] = "${{KIPRJMOD}}/{}/{}".format(LOCAL_LIB_DIRNAME, local_name)
         local_libs[nick] = local_lib
 
-    # Fields deleted from every placed symbol leave the local copy as well.
+    # The local copy follows the placed symbols: fields changed, added or
+    # deleted on every one of them (symbol_updates).
     schematics = glob.glob(os.path.join(project_dir, "*.kicad_sch"))
-    by_lib = {}
-    for lid, fields in placed_fields(schematics).items():
-        if ":" in lid:
-            nick, name = lid.split(":", 1)
-            by_lib.setdefault(nick, {})[name] = fields
-    pruned = {}             # nick -> (defs, drops)
-    fields_removed = 0
+    placed = _placed_by_library(schematics)
+    synced = {}             # nick -> (defs, updates)
+    fields_changed = 0
     for nick, lib in local_libs.items():
-        defs, drops, n = _prune_library_fields(session, lib, by_lib.get(nick, {}))
-        pruned[nick] = (defs, drops)
-        fields_removed += n
+        defs, updates, n = _sync_library(session, lib, placed.get(nick, {}))
+        synced[nick] = (defs, updates)
+        fields_changed += n
 
-    remapped = 0
-    for sch in schematics:
-        text = _read(sch)
-        root = sexpr.parse(text)
-        editor = sexpr.Editor(text)
-        touched = False
+    def remap(editor, atom):
+        if atom.kind != "atom" or ":" not in atom.value:
+            return False
+        nick, name = atom.value.split(":", 1)
+        if nick not in src_file:
+            return False
+        editor.replace_atom(atom, "{}:{}".format(nick + LOCAL_SUFFIX, name),
+                            force_quote=True)
+        return True
 
-        def remap(atom):
-            nonlocal remapped, touched
-            if atom.kind != "atom" or ":" not in atom.value:
-                return
-            nick, name = atom.value.split(":", 1)
-            if nick in src_file:
-                editor.replace_atom(atom, "{}:{}".format(nick + LOCAL_SUFFIX, name),
-                                    force_quote=True)
-                remapped += 1
-                touched = True
-
-        for lst in root.iter_lists():
-            head = lst.head()
-            if head == "lib_id" and lst.children[1:]:
-                remap(lst.children[1])
-            elif head == "lib_symbols":
-                # direct child (symbol "nick:name" ...) entries only
-                for child in lst.children:
-                    if child.kind == "list" and child.head() == "symbol" and child.children[1:]:
-                        remap(child.children[1])
-                        nick, _, name = child.children[1].value.partition(":")
-                        if nick not in pruned:
-                            continue
-                        defs, drops = pruned[nick]
-                        fields = user_fields(child)
-                        for f in cache_drops(name, fields, defs, drops):
-                            _delete_span(editor, text, fields[f])
-                            touched = True
-        if touched:
-            write_validated(session, sch, editor.result())
+    remapped = _sync_schematic_caches(session, schematics, synced, rename=remap)
 
     add_lib_entries(session, "sym", entries)
     return {"libraries": len(entries), "files_copied": copied, "remapped": remapped,
-            "fields_removed": fields_removed}
+            "fields_changed": fields_changed}
 
 
 # --- dispatcher --------------------------------------------------------------
@@ -1799,16 +1994,21 @@ def apply_selection(session, rows):
     are file-level; models are handled here too (file-level) unless the caller
     localizes them live over IPC instead. Returns {scope: summary}."""
     result = {}
-    syms = [r for r in rows if r["type"] == "symbol"]
+    syms = [r for r in rows if r["type"] == "symbol" and r["status"] != "update"]
+    stale = [r for r in rows if r["type"] == "symbol" and r["status"] == "update"]
     fps = [r for r in rows if r["type"] == "footprint"]
     libmodels = [r for r in rows if r["type"] == "model" and r["key"][0] == "libmodel"]
     rows = [r for r in rows if r["key"][0] != "libmodel"]
     models = [r for r in rows if r["type"] == "model" and r["status"] != "embedded"]
     embedded = [r for r in rows if r["type"] == "model" and r["status"] == "embedded"]
-    if syms:
-        result["symbols"] = localize_symbols(session, syms)
+    # Footprints first: they may rewrite the schematic Footprint fields that
+    # the symbol libraries are then brought in line with.
     if fps:
         result["footprints"] = localize_footprints(session, fps)
+    if syms:
+        result["symbols"] = localize_symbols(session, syms)
+    if stale:
+        result["symbol_updates"] = update_symbols(session, stale)
     if models:
         result["models"] = localize_models(session, models)
     if embedded:

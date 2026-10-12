@@ -32,8 +32,8 @@ COL_TYPE, COL_REF, COL_NAME, COL_SOURCE, COL_STATUS = range(5)
 _COL_TITLES = ("Type", "Reference", "Name", "Source", "Status")
 GREY = wx.Colour(140, 140, 140)
 # Sort order when sorting by status: the localizable rows come first.
-_STATUS_ORDER = {"external": 0, "rebuild": 1, "nested": 2, "standard": 3, "embedded": 4,
-                 "missing": 5, "local": 6}
+_STATUS_ORDER = {"external": 0, "update": 1, "rebuild": 2, "nested": 3, "standard": 4,
+                 "embedded": 5, "missing": 6, "local": 7}
 _TYPE_ORDER = {"symbol": 0, "footprint": 1, "model": 2}
 
 
@@ -69,7 +69,10 @@ def _localizable(row):
     # board's copy of it.
     # "nested": a local 3D model in a packages3D subfolder, moved up to
     # packages3D/ itself.
-    return row["status"] in ("external", "standard", "embedded", "rebuild", "nested")
+    # "update": a symbol in a project library whose fields no longer match
+    # the placed symbols; the library is brought in line, not copied.
+    return row["status"] in ("external", "standard", "embedded", "rebuild", "nested",
+                             "update")
 
 
 class LocalizeDialog(wx.Dialog):
@@ -83,7 +86,7 @@ class LocalizeDialog(wx.Dialog):
         self._populating = False
         # Checked by default: external rows. The "include standard" box adds the
         # standard rows. Selection is tracked by row key so a re-sort keeps it.
-        self._checked = {r["key"] for r in rows if r["status"] in ("external", "rebuild", "nested")}
+        self._checked = {r["key"] for r in rows if r["status"] in portability.DEFAULT_ON}
 
         icon = os.path.join(os.path.dirname(os.path.abspath(__file__)), "icon.png")
         if os.path.exists(icon):
@@ -196,6 +199,7 @@ class LocalizeDialog(wx.Dialog):
                 "embedded": "embedded",
                 "rebuild": "missing: rebuild from board",
                 "nested": "local, in subfolder",
+                "update": "local, fields differ",
                 "local": "already local", "missing": "MISSING"}.get(
                     row["status"], row["status"])
 
@@ -346,9 +350,13 @@ class LocalizeDialog(wx.Dialog):
             r = result["symbols"]
             parts.append("Symbols: {} libraries, {} references".format(
                 r["libraries"], r["remapped"]))
-            if r.get("fields_removed"):
-                parts.append("  {} library field(s) removed that no placed symbol "
-                             "carries any more".format(r["fields_removed"]))
+            if r.get("fields_changed"):
+                parts.append("  {} library field(s) brought in line with the placed "
+                             "symbols".format(r["fields_changed"]))
+        if result.get("symbol_updates"):
+            r = result["symbol_updates"]
+            parts.append("Symbols: {} field(s) updated in {} project librar{}".format(
+                r["fields_changed"], r["libraries"], "y" if r["libraries"] == 1 else "ies"))
         if result.get("footprints"):
             r = result["footprints"]
             parts.append("Footprints: {} libraries, {} files, {} references, "
@@ -534,7 +542,7 @@ class LocalizeDialog(wx.Dialog):
     def refresh(self):
         busy = wx.BusyCursor()  # spinning cursor while the project is re-scanned
         self.rows = portability.scan_items(self.project_dir, self.include_std.GetValue())
-        self._checked = {r["key"] for r in self.rows if r["status"] in ("external", "rebuild", "nested")}
+        self._checked = {r["key"] for r in self.rows if r["status"] in portability.DEFAULT_ON}
         if self.include_std.GetValue():
             self._checked |= {r["key"] for r in self.rows if r["status"] == "standard"}
         self.apply_sort()

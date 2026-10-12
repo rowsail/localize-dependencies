@@ -78,13 +78,8 @@ install it, and restart the PCB editor.
      already in a `packages3D` subfolder show as *local, in subfolder* and are
      moved up. Models named by the project's own footprint libraries are
      included too.
-   - A field you deleted from every placed instance of a symbol (an LCSC
-     number, say) is removed from the local library copy and the
-     schematic's cached copy too, so *Update Symbols from Library* doesn't
-     bring it back. Mandatory fields (Reference, Value, Footprint,
-     Datasheet, Description), KiCad's `ki_*` properties and attributes such
-     as DNP are never touched, and a field any placed instance still has
-     stays.
+   - The library copy follows the placed symbols; see
+     [Symbols that no longer match their library](#symbols-that-no-longer-match-their-library).
    - `sym-lib-table` and `fp-lib-table` get the new entries, and every
      reference is updated, including the schematic symbols' Footprint fields,
      so *Update PCB from Schematic* keeps the local footprints.
@@ -95,6 +90,30 @@ install it, and restart the PCB editor.
    from KiCad before reopening, or you'll write the old paths back over the new
    files.
 5. To undo, run the plugin again and hit Revert.
+
+### Symbols that no longer match their library
+
+When you edit a placed symbol's fields (a new LCSC number, a field
+renamed from `LCSC Part` to `LCSC`, a field deleted), its library symbol
+keeps the old ones, and *Update Symbols from Library* puts them back. A
+symbol in a project library (`${KIPRJMOD}`) whose library no longer matches
+shows as *local, fields differ* and is ticked. Localize then updates the
+library and the schematic's cached copy in place (nothing is copied):
+
+- a field every placed instance has, with one value that differs from the
+  library's, takes that value (Value, Footprint, Datasheet and Description
+  included);
+- a field every placed instance has that the library lacks is added,
+  hidden;
+- a user field no placed instance has any more is removed.
+
+A field the placed instances disagree on (the Value of a generic resistor
+used at several values) is left as it is, as are Reference, KiCad's
+`ki_*` properties and attributes such as DNP. A value of `~` counts as
+empty. With `extends`, values are only changed on symbols that have no
+parent and that nothing placed extends; removals follow the symbol that
+defines the field. External libraries get the same treatment in their new
+local copy. Revert undoes it.
 
 ### Footprints whose library is gone
 
@@ -162,7 +181,7 @@ Each test file runs on its own with `python tests/<file>.py`:
 - `test_safety.py` and `test_versions.py`: the engine, pure Python.
 - `test_embedded.py`: embedded 3D models. Needs `zstandard` or the `zstd` tool.
 - `test_symbols.py`: symbol libraries, single-file and folder (`.kicad_symdir`),
-  and fields deleted from placed symbols leaving the local copy.
+  and library symbols brought in line with their placed symbols.
 - `test_step.py`: "Use STEP instead of VRML", and KiCad path variables.
 - `test_models.py`: models in project footprint libraries, flat `packages3D/`.
 - `test_footprints.py`: footprint localization updates the schematic's

@@ -158,7 +158,7 @@ def test_fields_deleted_from_placed_symbols_leave_the_library():
         s = portability.Session(proj)
         res = portability.apply_selection(s, _sym_rows(proj))
         s.save_manifest(res)
-        assert res["symbols"]["fields_removed"] == 2, res
+        assert res["symbols"]["fields_changed"] == 2, res
         lib = sexpr.parse(open(os.path.join(proj, "libs", "One_local.kicad_sym"),
                                encoding="utf-8").read())
         got = {sy.children[1].value: sorted(portability.user_fields(sy))
@@ -172,6 +172,89 @@ def test_fields_deleted_from_placed_symbols_leave_the_library():
         assert cache == {"One_local:U": ["MPN"], "One_local:V": ["Mfr"]}, cache
         assert portability.revert(proj)["errors"] == []
         assert _bytes(sch_path) == before
+    finally:
+        shutil.rmtree(root)
+
+
+def _stale_project():
+    """Project library 'Proj' (a folder library): R330 still says FOJAN and
+    'LCSC Part' C2933198, while every placed R330 now has MPN
+    AF0603FR-07330RL and 'LCSC' C144102. Generic R is placed with two
+    different values. Q is up to date (its placed Datasheet "~" is KiCad's
+    old way of writing empty)."""
+    root = tempfile.mkdtemp()
+    proj = os.path.join(root, "proj")
+    lib = os.path.join(proj, "libs", "Proj.kicad_symdir")
+    p = lambda n, v: '(property "{}" "{}" (at 0 0 0))'.format(n, v)  # noqa: E731
+
+    def sym(name, *props):
+        return LIB_HEAD + '\t(symbol "{}"\n'.format(name) + "".join(
+            "\t\t" + p(*kv) + "\n" for kv in props) + "\t)\n)\n"
+    _write(os.path.join(lib, "R330.kicad_sym"), sym(
+        "R330", ("Reference", "R"), ("Value", "FRC0603F3300TS"), ("ki_keywords", "R"),
+        ("MPN", "FRC0603F3300TS"), ("LCSC Part", "C2933198")))
+    _write(os.path.join(lib, "R.kicad_sym"), sym("R", ("Reference", "R"), ("Value", "R")))
+    _write(os.path.join(lib, "Q.kicad_sym"), sym("Q", ("Reference", "Q"), ("Datasheet", ""),
+                                                          ("LCSC", "C1")))
+    _write(os.path.join(proj, "sym-lib-table"),
+           '(sym_lib_table\n\t(version 7)\n\t(lib (name "Proj")(type "KiCad")'
+           '(uri "${KIPRJMOD}/libs/Proj.kicad_symdir")(options "")(descr ""))\n)\n')
+    r330 = lambda ref, ln="": ('\t(symbol (lib_id "Proj:R330") ' + ln + p("Reference", ref) + " " +  # noqa: E731
+                        p("Value", "330R 0603") + " " + p("MPN", "AF0603FR-07330RL") + " " +
+                        p("LCSC", "C144102") + ")\n")
+    _write(os.path.join(proj, "top.kicad_sch"),
+           "(kicad_sch\n\t(lib_symbols\n"
+           '\t\t(symbol "Proj:R330"\n\t\t\t' + p("Value", "FRC0603F3300TS") +
+           '\n\t\t\t' + p("MPN", "FRC0603F3300TS") + '\n\t\t\t' + p("LCSC Part", "C2933198") +
+           '\n\t\t)\n\t\t(symbol "R330_1"\n\t\t\t' + p("Value", "FRC0603F3300TS") +
+           '\n\t\t\t' + p("LCSC Part", "C2933198") +
+           '\n\t\t)\n\t\t(symbol "Proj:R"\n\t\t\t' + p("Value", "R") + '\n\t\t)\n'
+           '\t\t(symbol "Proj:Q"\n\t\t\t' + p("LCSC", "C1") + '\n\t\t)\n\t)\n' +
+           r330("R13") + r330("R55", '(lib_name "R330_1") ') +
+           '\t(symbol (lib_id "Proj:R") ' + p("Reference", "R1") + " " + p("Value", "10k") + ")\n"
+           '\t(symbol (lib_id "Proj:R") ' + p("Reference", "R2") + " " + p("Value", "1k") + ")\n"
+           '\t(symbol (lib_id "Proj:Q") ' + p("Reference", "Q1") + " " + p("Datasheet", "~") + " " +
+           p("LCSC", "C1") + ")\n"
+           ")\n")
+    return root, proj
+
+
+def test_project_library_out_of_step_is_offered_and_updated():
+    root, proj = _stale_project()
+    try:
+        rows = _sym_rows(proj)
+        st = {r["ref"]: (r["status"], r["wanted"]) for r in rows}
+        assert st == {"R13": ("update", True), "R55": ("update", True),
+                      "R1": ("local", False), "R2": ("local", False),
+                      "Q1": ("local", False)}, st
+        sch_path = os.path.join(proj, "top.kicad_sch")
+        before = _bytes(sch_path)
+        s = portability.Session(proj)
+        res = portability.apply_selection(s, [r for r in rows if r["wanted"]])
+        s.save_manifest(res)
+        assert res["symbol_updates"] == {"libraries": 1, "fields_changed": 4}, res
+        assert "symbols" not in res, "a project library is updated, not copied"
+        assert not os.path.exists(os.path.join(proj, "libs", "Proj_local.kicad_symdir"))
+        lib = os.path.join(proj, "libs", "Proj.kicad_symdir")
+        defs, _ = portability.library_definitions(lib)
+        assert defs["R330"][0] == {"Reference": "R", "Value": "330R 0603",
+                                   "MPN": "AF0603FR-07330RL", "LCSC": "C144102"}, defs["R330"]
+        assert '"ki_keywords"' in open(os.path.join(lib, "R330.kicad_sym"), encoding="utf-8").read()
+        assert defs["R"][0]["Value"] == "R", "placed values disagree: left alone"
+        sch = sexpr.parse(open(sch_path, encoding="utf-8").read())
+        cache = {sy.children[1].value: {n: c.children[2].value
+                                        for n, c in portability._fields(sy).items()}
+                 for sy in sch.find("lib_symbols").find_all("symbol")}
+        assert cache["Proj:R330"] == {"Value": "330R 0603", "MPN": "AF0603FR-07330RL",
+                                      "LCSC": "C144102"}, cache
+        assert cache["R330_1"] == {"Value": "330R 0603", "LCSC": "C144102"}, \
+            "a renamed cache copy (lib_name) follows its lib_id"
+        assert cache["Proj:R"] == {"Value": "R"}
+        again = {r["ref"]: r["status"] for r in _sym_rows(proj)}
+        assert set(again.values()) == {"local"}, again
+        assert portability.revert(proj)["errors"] == []
+        assert _bytes(sch_path) == before
+        assert "C2933198" in open(os.path.join(lib, "R330.kicad_sym"), encoding="utf-8").read()
     finally:
         shutil.rmtree(root)
 
