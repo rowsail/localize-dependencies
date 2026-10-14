@@ -128,11 +128,35 @@ def make_resolver(project_dir):
 
         return os.path.normpath(re.sub(r"\$\{([^}]+)\}", repl, s))
 
+    lib_dirs = []           # filled on first use: see relative_roots()
+
+    def relative_roots():
+        """Where a relative path (a 3D model's "../3dmodels/X.step", say) can
+        live: the project folder first -- KiCad resolves it there -- then
+        the folders of the footprint libraries the project and global
+        tables name, since a library footprint's relative model path was
+        written relative to its own library."""
+        if not lib_dirs:
+            lib_dirs.append(project_dir)
+            tables = [os.path.join(project_dir, "fp-lib-table")]
+            tables += [os.path.join(d, "fp-lib-table") for d in _config_dirs()[:1]]
+            for t in tables:
+                for uri in parse_lib_table(t).values():
+                    for share in (shares or [None]):
+                        d = resolve_with(uri.replace("${KIPRJMOD}", project_dir), share)
+                        if os.path.isabs(d) and os.path.isdir(d) and d not in lib_dirs:
+                            lib_dirs.append(d)
+                            break
+        return lib_dirs
+
     def resolve(raw):
         if not raw:
             return raw
         s = re.sub(r"\$\(([^)]+)\)", r"${\1}", raw)   # $(VAR) -> ${VAR}
         candidates = [resolve_with(s, share) for share in shares] or [resolve_with(s, None)]
+        if not os.path.isabs(candidates[0]):
+            rel = candidates[0]
+            candidates = [os.path.normpath(os.path.join(root, rel)) for root in relative_roots()]
         for c in candidates:
             if os.path.exists(c):
                 return c

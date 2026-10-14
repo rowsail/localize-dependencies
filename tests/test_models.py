@@ -105,6 +105,39 @@ def test_subfolder_copy_still_in_use_is_kept():
         shutil.rmtree(root)
 
 
+def test_relative_model_path_found_beside_its_library():
+    """A footprint copied out of a library keeps that library's relative
+    model path ("../3dmodels/X.step"). It isn't next to the project, so it
+    is found beside the footprint library instead, offered as external and
+    localized to packages3D/; the plugin's own working directory plays no
+    part."""
+    root = tempfile.mkdtemp()
+    try:
+        proj = os.path.join(root, "proj")
+        lib = os.path.join(root, "vendor", "Parts.pretty").replace("\\", "/")
+        _write(os.path.join(root, "vendor", "3dmodels", "X.step"), "STEP-X")
+        _write(os.path.join(lib, "X.kicad_mod"), '(footprint "X")\n')
+        _write(os.path.join(proj, "fp-lib-table"),
+               '(fp_lib_table\n\t(version 7)\n'
+               '\t(lib (name "Parts")(type "KiCad")(uri "{}")(options "")(descr ""))\n)\n'.format(lib))
+        pcb = os.path.join(proj, "board.kicad_pcb")
+        _write(pcb, '(kicad_pcb\n\t(footprint "Parts:X" (property "Reference" "U1")\n'
+               '\t\t(model "../3dmodels/X.step"))\n)\n')
+        cwd = os.getcwd()
+        os.chdir(root)      # a cwd where "../3dmodels" would NOT be found
+        try:
+            rows = [r for r in portability.scan_items(proj) if r["type"] == "model"]
+        finally:
+            os.chdir(cwd)
+        assert [(r["status"], r["wanted"]) for r in rows] == [("external", True)], rows
+        s = portability.Session(proj)
+        s.save_manifest(portability.apply_selection(s, rows))
+        assert _bytes(os.path.join(proj, "packages3D", "X.step")) == b"STEP-X"
+        assert '(model "${KIPRJMOD}/packages3D/X.step")' in open(pcb, encoding="utf-8").read()
+    finally:
+        shutil.rmtree(root)
+
+
 if __name__ == "__main__":
     for name, fn in sorted(globals().items()):
         if name.startswith("test_"):
