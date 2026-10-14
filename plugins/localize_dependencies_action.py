@@ -32,8 +32,8 @@ COL_TYPE, COL_REF, COL_NAME, COL_SOURCE, COL_STATUS = range(5)
 _COL_TITLES = ("Type", "Reference", "Name", "Source", "Status")
 GREY = wx.Colour(140, 140, 140)
 # Sort order when sorting by status: the localizable rows come first.
-_STATUS_ORDER = {"external": 0, "update": 1, "rebuild": 2, "nested": 3, "standard": 4,
-                 "embedded": 5, "missing": 6, "local": 7}
+_STATUS_ORDER = {"external": 0, "update": 1, "merge": 2, "rebuild": 3, "nested": 4,
+                 "standard": 5, "embedded": 6, "missing": 7, "local": 8}
 _TYPE_ORDER = {"symbol": 0, "footprint": 1, "model": 2}
 
 
@@ -71,8 +71,11 @@ def _localizable(row):
     # packages3D/ itself.
     # "update": a symbol in a project library whose fields no longer match
     # the placed symbols; the library is brought in line, not copied.
+    # "merge": a symbol or footprint in a project library other than the
+    # project's own (an earlier run's libs/<nick>_local.*); moved into
+    # libs/<project>.kicad_sym / libs/<project>.pretty.
     return row["status"] in ("external", "standard", "embedded", "rebuild", "nested",
-                             "update")
+                             "update", "merge")
 
 
 class LocalizeDialog(wx.Dialog):
@@ -200,6 +203,7 @@ class LocalizeDialog(wx.Dialog):
                 "rebuild": "missing: rebuild from board",
                 "nested": "local, in subfolder",
                 "update": "local, fields differ",
+                "merge": "local, other library",
                 "local": "already local", "missing": "MISSING"}.get(
                     row["status"], row["status"])
 
@@ -348,8 +352,13 @@ class LocalizeDialog(wx.Dialog):
         parts = []
         if result.get("symbols"):
             r = result["symbols"]
-            parts.append("Symbols: {} libraries, {} references".format(
-                r["libraries"], r["remapped"]))
+            parts.append("Symbols: {} copied into the project library, {} references".format(
+                r.get("symbols_copied", 0), r["remapped"]))
+            if r.get("renamed"):
+                parts.append("  renamed (a different symbol has the name): " + ", ".join(
+                    "{} -> {}".format(k, v) for k, v in sorted(r["renamed"].items())))
+            if r.get("libraries_merged"):
+                parts.append("  merged and removed: " + ", ".join(r["libraries_merged"]))
             if r.get("fields_changed"):
                 parts.append("  {} library field(s) brought in line with the placed "
                              "symbols".format(r["fields_changed"]))
@@ -363,10 +372,15 @@ class LocalizeDialog(wx.Dialog):
                              "y" if r.get("schematic_copies", 0) == 1 else "ies"))
         if result.get("footprints"):
             r = result["footprints"]
-            parts.append("Footprints: {} libraries, {} files, {} references, "
+            parts.append("Footprints: {} files into the project library, {} references, "
                          "{} schematic footprint fields".format(
-                             r["libraries"], r["files_copied"], r["remapped"],
+                             r["files_copied"], r["remapped"],
                              r.get("schematic_fields", 0)))
+            if r.get("renamed"):
+                parts.append("  renamed (a different footprint has the name): " + ", ".join(
+                    "{} -> {}".format(k, v) for k, v in sorted(r["renamed"].items())))
+            if r.get("libraries_merged"):
+                parts.append("  merged and removed: " + ", ".join(r["libraries_merged"]))
             if r.get("rebuilt_from_board"):
                 parts.append("  {} footprint(s) rebuilt from the board copy "
                              "(library file missing)".format(r["rebuilt_from_board"]))

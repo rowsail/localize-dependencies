@@ -1,5 +1,5 @@
 """Collect the symbols a project's schematic actually uses into ONE project
-symbol library (a KiCad 10 folder library, one .kicad_sym per symbol) -- or,
+symbol library, libs/<NICK>.kicad_sym -- or,
 with --footprints, the footprints its boards place into ONE footprint
 library, libs/<NICK>.pretty (schematic Footprint fields follow; a footprint
 whose library file is gone is rebuilt from the board).
@@ -20,13 +20,13 @@ saved and committed first):
   number, say) is left out of the library and the schematic's cached copy,
   so *Update Symbols from Library* doesn't bring it back. Mandatory fields,
   ki_* properties and attributes such as DNP are never touched.
-- Names are made portable, since KiCad saves each symbol as <name>.kicad_sym:
-  plain ASCII that Windows and macOS accept (Ω -> ohm, ± -> +-, µ -> u,
-  ° -> deg, other non-ASCII reduced to ASCII, / \\ : | -> -, ? -> _, * -> x,
-  < > -> lt gt, trailing space/dot dropped, reserved names get "_").
-- Names that then clash only by case: lower-case 'm' -> 'milli', upper 'M'
-  -> 'MEG' (resistor values, e.g. 100mohm / 100Mohm).
-- kicad-cli writes libs/<NICK>.kicad_symdir; the hierarchy's lib_id and
+- Symbol names are kept as they are (one file holds them all). Footprint
+  names, which are file names, are made portable: plain ASCII that Windows
+  and macOS accept (Ω -> ohm, ± -> +-, µ -> u, ° -> deg, other non-ASCII
+  reduced to ASCII, / \\ : | -> -, ? -> _, * -> x, < > -> lt gt, trailing
+  space/dot dropped, reserved names get "_"); names that then clash only by
+  case: lower-case 'm' -> 'milli', upper 'M' -> 'MEG' (100mohm / 100Mohm).
+- kicad-cli writes libs/<NICK>.kicad_sym; the hierarchy's lib_id and
   lib_symbols names are rewritten to NICK:<name>; sym-lib-table gets NICK and
   loses the project-local (${KIPRJMOD}) libraries that were merged.
 - --remove-old also deletes those merged project-local library files.
@@ -105,17 +105,10 @@ def hierarchy(proj, root):
 
 
 def library_symbols(path):
-    """{name: (text, parent)} from a .kicad_sym file or a folder library."""
-    files = ([os.path.join(path, f) for f in sorted(os.listdir(path))
-              if f.lower().endswith(".kicad_sym")] if os.path.isdir(path) else [path])
-    out = {}
-    for f in files:
-        t = _read(f)
-        for s in sexpr.parse(t).find_all("symbol"):
-            ext = s.find("extends")
-            out[s.children[1].value] = (t[s.start:s.end],
-                                        ext.children[1].value if ext else None)
-    return out
+    """{name: (text, parent)} from a .kicad_sym file or a folder library
+    ("~" field values of pre-KiCad 10 files emptied: see
+    portability._symbol_blocks)."""
+    return portability._symbol_blocks(path)
 
 
 def rename_block(t, old, new):
@@ -206,22 +199,13 @@ def plan(proj, nick, root):
             for k in ks[1:]:
                 newname[k] = "{}_{}".format(name, k[0].replace("_local", ""))
     taken = set()
-    for k in sorted(newname, key=lambda k: (newname[k] != portable(newname[k]), newname[k])):
-        p = portable(newname[k])
-        q, i = p, 1
-        while q in taken and q != newname[k]:
+    for k in sorted(newname, key=lambda k: (newname[k] != k[1], newname[k])):
+        q, i = newname[k], 1
+        while q in taken:
             i += 1
-            q = "{}_{}".format(p, i)
+            q = "{}_{}".format(newname[k], i)
         newname[k] = q
         taken.add(q)
-    low = collections.defaultdict(set)
-    for v in newname.values():
-        low[v.lower()].add(v)
-    for group in low.values():
-        if len(group) > 1:
-            for k, v in list(newname.items()):
-                if v in group:
-                    newname[k] = unclash_case(v)
     for k in need:
         if newname[k] != k[1]:
             renamed[":".join(k)] = newname[k]
@@ -229,9 +213,9 @@ def plan(proj, nick, root):
 
 
 def apply(proj, nick, sheets, need, newname, lib_paths, remove_old, cache_drop=None):
-    folder = os.path.join(proj, "libs", nick + ".kicad_symdir")
-    if os.path.exists(folder):
-        sys.exit(folder + " already exists")
+    out = os.path.join(proj, "libs", nick + ".kicad_sym")
+    if os.path.exists(out):
+        sys.exit(out + " already exists")
     seen, blocks = set(), []
     for k in sorted(need, key=lambda k: newname[k].lower()):
         n = newname[k]
@@ -247,9 +231,9 @@ def apply(proj, nick, sheets, need, newname, lib_paths, remove_old, cache_drop=N
     with open(combined, "w", encoding="utf-8") as fh:
         fh.write('(kicad_symbol_lib\n\t(version 20251024)\n\t(generator "kicad_symbol_editor")\n'
                  '\t(generator_version "10.0")\n' + "\n".join(blocks) + "\n)\n")
-    os.makedirs(folder)
+    os.makedirs(os.path.dirname(out), exist_ok=True)
     cli = os.environ.get("KICAD_CLI") or shutil.which("kicad-cli") or "kicad-cli"
-    subprocess.run([cli, "sym", "upgrade", "--force", "-o", folder, combined],
+    subprocess.run([cli, "sym", "upgrade", "--force", "-o", out, combined],
                    check=True, capture_output=True)
     os.remove(combined)
 
@@ -290,7 +274,7 @@ def apply(proj, nick, sheets, need, newname, lib_paths, remove_old, cache_drop=N
     merged_local = {n for n, (uri, _p) in lib_paths.items() if "${KIPRJMOD}" in uri}
     for n in merged_local:
         t = re.sub(r'[ \t]*\(lib \(name "{}"\)[^\n]*\n'.format(re.escape(n)), "", t)
-    entry = ('\t(lib (name "{}")(type "KiCad")(uri "${{KIPRJMOD}}/libs/{}.kicad_symdir")'
+    entry = ('\t(lib (name "{}")(type "KiCad")(uri "${{KIPRJMOD}}/libs/{}.kicad_sym")'
              '(options "")(descr "Project symbols: only those the schematic uses"))\n').format(nick, nick)
     close = t.rstrip().rfind(")")
     t = t[:close] + entry + t[close:]
@@ -484,7 +468,7 @@ def main():
         return
     sheets, used, need, newname, renamed, lib_paths, cache_drop, dropped = plan(proj, nick, root)
     report = {
-        "library": "libs/{}.kicad_symdir".format(nick),
+        "library": "libs/{}.kicad_sym".format(nick),
         "sheets": sheets,
         "placed_symbols": sum(used.values()), "unique_used": len(used),
         "symbols": len(set(newname.values())),

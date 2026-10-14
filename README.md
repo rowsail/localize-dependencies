@@ -73,9 +73,17 @@ install it, and restart the PCB editor.
    standard KiCad libraries" if you want it fully independent of the global
    libraries.
 3. Click Localize.
-   - External symbols and footprints land in `libs/<name>_local.*`. A KiCad 10
-     folder symbol library is copied as a folder,
-     `libs/<name>_local.kicad_symdir`.
+   - Symbols and footprints all go into ONE project library each, named after
+     the project: `libs/<project>.kicad_sym` and `libs/<project>.pretty`.
+     Only the symbols the schematic uses are copied (with any symbol they
+     extend), from single-file and KiCad 10 folder libraries alike. A part
+     whose name is already taken there by a different part is renamed
+     `<name>_<library>`; an identical one is shared.
+   - Parts in any other project library (an earlier version's
+     `libs/<name>_local.*` copies, say) show as *local, other library* and
+     are ticked: Localize moves them in too, and a project library left with
+     nothing using it is removed from the table and the disk (Revert brings
+     it back).
    - 3D models go directly in `packages3D/`, never in a subfolder. Models
      already in a `packages3D` subfolder show as *local, in subfolder* and are
      moved up. Models named by the project's own footprint libraries are
@@ -131,9 +139,9 @@ footprint's library (or just its `.kicad_mod`) can't be found, the row shows
 *missing: rebuild from board* and is ticked: Localize rebuilds the library
 footprint from the board's copy, the way KiCad's *Export Footprints to
 Library* does (rotation undone, flipped back to the front, nets cleared,
-reference `REF**`), into `libs/<name>_local.pretty`; if the library was
-already a project library, the file is put back where it belongs and nothing
-is remapped. The rebuilt footprint is a clean library footprint: Value is its
+reference `REF**`), into `libs/<project>.pretty`; if the library was
+already the project library, the file is put back where it belongs and
+nothing is remapped. The rebuilt footprint is a clean library footprint: Value is its
 name and part-number fields (LCSC, MPN, ...) are left out, so one placed
 part's numbers can't leak into every other part using that footprint. The
 board's 3D model paths (and any embedded model) come along. Back-side parts are
@@ -189,13 +197,16 @@ Each test file runs on its own with `python tests/<file>.py`:
 
 - `test_safety.py` and `test_versions.py`: the engine, pure Python.
 - `test_embedded.py`: embedded 3D models. Needs `zstandard` or the `zstd` tool.
-- `test_symbols.py`: symbol libraries, single-file and folder (`.kicad_symdir`),
-  and library symbols brought in line with their placed symbols.
+- `test_symbols.py`: symbols from single-file and folder (`.kicad_symdir`)
+  libraries into the one project library, merging earlier `_local` copies,
+  name clashes and `extends`, and library symbols brought in line with their
+  placed symbols.
 - `test_step.py`: "Use STEP instead of VRML", and KiCad path variables.
 - `test_models.py`: models in project footprint libraries, flat `packages3D/`.
-- `test_footprints.py`: footprint localization updates the schematic's
-  Footprint fields too, including symbols shared by reused sheets, and
-  footprints are rebuilt from the board when their library is gone.
+- `test_footprints.py`: footprints into the one project library (merging
+  earlier `_local` copies, renaming clashes), the schematic's Footprint
+  fields following, including symbols shared by reused sheets, and
+  footprints rebuilt from the board when their library is gone.
 - `tools/verify_rebuild.py <board>`: checks the rebuild against KiCad's own
   library save, footprint by footprint (`--flip left_right` for that setting).
   Needs KiCad's `pcbnew` Python module.
@@ -216,8 +227,10 @@ in KiCad. CI runs all of the above on every push, including
 ## Tools
 
 `tools/onelib.py` collects the symbols a schematic actually uses into one
-project library, `libs/<project>.kicad_symdir` (a KiCad 10 folder library, one
-file per symbol), and points the schematic at it:
+project library, `libs/<project>.kicad_sym`, and points the schematic at it
+(`--footprints` does the same for the board's footprints,
+`libs/<project>.pretty`). Localize now does this itself; the tool is for
+projects you don't want to run the dialog on:
 
 ```
 python tools/onelib.py <project_dir>                        # plan only
@@ -232,10 +245,11 @@ project.
 Symbols come from whichever library `sym-lib-table` names (or, if none has
 them, the schematic's own cached copy). Two different symbols with one name
 are kept apart (`<name>_<library>`). Fields deleted from every placed
-instance are left out, as in Localize. File names are made portable: plain
-ASCII that Windows and macOS accept (`100kΩ 0805` becomes `100kohm 0805`), and
-names that would then differ only in case use `milli` / `MEG` (`100mohm` →
-`100milliohm`, `100Mohm` → `100MEGohm`). Only names change; Value fields don't.
+instance are left out, as in Localize. Symbol names are kept. Footprint
+names, which are file names, are made portable: plain ASCII that Windows and
+macOS accept (`100kΩ 0805` becomes `100kohm 0805`), and names that would
+then differ only in case use `milli` / `MEG` (`100mohm` → `100milliohm`,
+`100Mohm` → `100MEGohm`). Only names change; Value fields don't.
 Close KiCad and commit the project first. `kicad-cli` writes the library.
 
 `--footprints` does the same for footprints: the boards' footprints go into

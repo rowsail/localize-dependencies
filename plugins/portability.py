@@ -507,6 +507,7 @@ def scan_items(project_dir, include_standard=False):
             nick = libid.split(":", 1)[0] if ":" in libid else ""
             uri = resolve_lib_uri(project_dir, "sym-lib-table", nick) if nick else None
             cat = classify_lib(uri, project_dir) if nick else "local"
+            cat = _merge_status(cat, nick, project_dir)
             if cat == "local" and libid in stale:
                 cat = "update"      # project library out of step with the parts
             rows.append({"type": "symbol", "ref": _prop(sym, "Reference") or "?",
@@ -526,6 +527,7 @@ def scan_items(project_dir, include_standard=False):
             nick = fpid.split(":", 1)[0] if ":" in fpid else ""
             uri = resolve_lib_uri(project_dir, "fp-lib-table", nick) if nick else None
             cat = classify_lib(uri, project_dir) if nick else "local"
+            cat = _merge_status(cat, nick, project_dir)
             if nick and not os.path.isfile(_footprint_file(project_dir, uri, fpid)):
                 cat = "rebuild"     # library or file gone: rebuild from the board copy
             rows.append({"type": "footprint", "ref": ref, "name": fpid,
@@ -686,8 +688,14 @@ def localize_library_models(session, rows):
             by_file.setdefault(r_["key"][1], set()).add(r_["key"][2])
     copied = remapped = 0
     placed = {}
+    pdir = project_lib(project_dir, "fp")[2]
     for rel, mis in by_file.items():
         path = os.path.join(project_dir, rel)
+        if not os.path.isfile(path):
+            # its library was merged into the project library since the scan
+            path = os.path.join(pdir, os.path.basename(path))
+            if not os.path.isfile(path):
+                continue
         text = _read(path)
         root = sexpr.parse(text)
         editor = sexpr.Editor(text)
@@ -1059,7 +1067,40 @@ def use_step_models(session):
 
 
 LOCAL_LIB_DIRNAME = "libs"
-LOCAL_SUFFIX = "_local"
+LOCAL_SUFFIX = "_local"     # libraries of earlier runs: libs/<nick>_local.*
+
+
+# Everything localized goes into ONE footprint library and ONE symbol library,
+# named after the project: libs/<project>.pretty and libs/<project>.kicad_sym.
+# Parts from other project (${KIPRJMOD}) libraries -- an earlier run's
+# libs/<nick>_local.* copies, say -- are offered as "merge" and moved in too.
+
+def project_nick(project_dir):
+    """The project library nickname: the name of the project's one .kicad_pro,
+    else the project folder's name."""
+    pros = glob.glob(os.path.join(project_dir, "*.kicad_pro"))
+    if len(pros) == 1:
+        return os.path.splitext(os.path.basename(pros[0]))[0]
+    return os.path.basename(os.path.abspath(project_dir).rstrip("/\\"))
+
+
+def project_lib(project_dir, kind):
+    """(nickname, uri, resolved path) of the project's own footprint ("fp")
+    or symbol ("sym") library. A library the project table already names
+    after the project is used wherever it is (a folder symbol library
+    included); otherwise libs/<project>.pretty / libs/<project>.kicad_sym."""
+    nick = project_nick(project_dir)
+    table = "fp-lib-table" if kind == "fp" else "sym-lib-table"
+    uri = parse_lib_table(os.path.join(project_dir, table)).get(nick)
+    if not uri:
+        uri = "${{KIPRJMOD}}/{}/{}{}".format(
+            LOCAL_LIB_DIRNAME, nick, LOCAL_FP_SUFFIX if kind == "fp" else ".kicad_sym")
+    return nick, uri, make_resolver(project_dir)(uri)
+
+
+def _merge_status(cat, nick, project_dir):
+    """"merge" for a part in a project library other than the project's own."""
+    return "merge" if cat == "local" and nick and nick != project_nick(project_dir) else cat
 
 
 def classify_lib(uri, project_dir):
@@ -1076,7 +1117,7 @@ def classify_lib(uri, project_dir):
 
 
 # Statuses ticked by default ("standard" only with the include-standard box).
-DEFAULT_ON = ("external", "rebuild", "nested", "update")
+DEFAULT_ON = ("external", "rebuild", "nested", "update", "merge")
 
 
 def _wanted(cat, include_standard):
@@ -1409,16 +1450,46 @@ def _best_instances(root):
     return best
 
 
+def _fp_body(text):
+    """A footprint file compared without its name, UUIDs and layout."""
+    t = re.sub(r'\(uuid "?[^")]*"?\)', "", text)
+    t = re.sub(r'^\(footprint "[^"]*"', "(footprint", t.lstrip())
+    return " ".join(t.split())
+
+
+def _rename_footprint(text, name):
+    return re.sub(r'^(\s*\(footprint\s+)"[^"]*"', lambda m: m.group(1) + sexpr.quote(name),
+                  text, count=1)
+
+
+def _clash_name(name, nick, taken):
+    """A free name for a part that clashes with a different one already in
+    the project library: <name>_<source library>, then _2, _3, ..."""
+    base = "{}_{}".format(name, nick[:-len(LOCAL_SUFFIX)] if nick.endswith(LOCAL_SUFFIX) else nick)
+    cand, i = base, 1
+    while taken(cand):
+        i += 1
+        cand = "{}_{}".format(base, i)
+    return cand
+
+
 def localize_footprints(session, rows):
-    """Copy the selected footprints into ${KIPRJMOD}/libs/<nick>_local.pretty,
-    register those libraries in fp-lib-table, and remap the selected footprint
-    IDs. Per-item: only the checked footprints move, and both the original and
-    the _local nickname stay valid, so unselected footprints are untouched.
+    """Copy the selected footprints into the project's one footprint library
+    (project_lib: libs/<project>.pretty), register it in fp-lib-table, and
+    remap the selected footprint IDs. Per-item: only the checked footprints
+    move, and the original library stays valid, so unselected footprints are
+    untouched. Footprints of other project libraries ("merge") move in the
+    same way; a project library left with nothing using it is dropped
+    (_drop_merged_libraries).
+
+    A footprint already in the project library under the same name is reused
+    when identical; a different one gets the name <name>_<source library>.
 
     The schematic symbols' Footprint fields follow (see
     _sync_schematic_footprints), or the next "Update PCB from Schematic" would
-    swap the footprints straight back to the global library. A footprint whose
-    library file can't be found is rebuilt from its copy in the board
+    swap the footprints straight back to the global library; so do the
+    default Footprint fields in the project's symbol libraries. A footprint
+    whose library file can't be found is rebuilt from its copy in the board
     (rebuild_footprint)."""
     project_dir = session.project_dir
     resolve = make_resolver(project_dir)
@@ -1430,12 +1501,15 @@ def localize_footprints(session, rows):
     for k in keys:
         by_pcb.setdefault(k[1], set()).add(k)
 
+    pnick, puri, pdir = project_lib(project_dir, "fp")
     entries = {}
     src_dir_cache = {}   # nick -> (resolved library dir, inside the project?)
     restored = set()     # footprint ids rebuilt into their own project library
     flip = flip_direction()
     copied = remapped = rebuilt = 0
     moved = {}          # board reference -> (old fpid, new fpid)
+    new_name = {}       # old fpid -> name in the project library
+    renamed = {}
     for rel, kset in by_pcb.items():
         pcb = os.path.join(project_dir, rel)
         text = _read(pcb)
@@ -1457,10 +1531,10 @@ def localize_footprints(session, rows):
                 src_dir_cache[nick] = (resolve(uri), "${KIPRJMOD}" in uri)
             src_dir, in_project = src_dir_cache[nick]
             src_file = os.path.join(src_dir, name + ".kicad_mod")
-            if in_project:
-                # already a project library: never re-localized. If it has
-                # lost this footprint, put the rebuilt file back where the
-                # table says it lives; the footprint id is already right.
+            if nick == pnick:
+                # already in the project library: never re-localized. If it
+                # has lost this footprint, put the rebuilt file back where
+                # the table says it lives; the footprint id is already right.
                 if not os.path.isfile(src_file) and atom.value not in restored:
                     session.mkdir(src_dir)
                     _write_rebuilt(session, src_file,
@@ -1469,36 +1543,156 @@ def localize_footprints(session, rows):
                     restored.add(atom.value)
                     rebuilt += 1
                 continue
-            local_nick = nick + LOCAL_SUFFIX
-            local_dir = os.path.join(project_dir, LOCAL_LIB_DIRNAME,
-                                     local_nick + LOCAL_FP_SUFFIX)
-            session.mkdir(local_dir)
-            dst_file = os.path.join(local_dir, name + ".kicad_mod")
-            if not (os.path.isfile(src_file) or os.path.isfile(dst_file)):
-                # library file gone: rebuild it from the board's copy
-                _write_rebuilt(session, dst_file,
-                               rebuild_footprint(text, best[atom.value], version, board_embeds,
-                                                     flip=flip))
-                rebuilt += 1
-            elif os.path.isfile(src_file) and not os.path.isfile(dst_file):
-                session.wrote_new_file(dst_file)
-                shutil.copy2(src_file, dst_file)
-                session.written(dst_file)
-                copied += 1
-            editor.replace_atom(atom, "{}:{}".format(local_nick, name), force_quote=True)
-            entries[local_nick] = "${{KIPRJMOD}}/{}/{}{}".format(
-                LOCAL_LIB_DIRNAME, local_nick, LOCAL_FP_SUFFIX)
+            if atom.value not in new_name:
+                if os.path.isfile(src_file):
+                    mod, how = _read(src_file), "copied"
+                else:   # library file gone: rebuild it from the board's copy
+                    mod, how = rebuild_footprint(text, best[atom.value], version, board_embeds,
+                                                 flip=flip), "rebuilt"
+                session.mkdir(pdir)
+                body = _fp_body(mod)
+                dst = lambda n: os.path.join(pdir, n + ".kicad_mod")  # noqa: E731
+                same = lambda n: _fp_body(_read(dst(n))) == body      # noqa: E731
+                target = name
+                if os.path.isfile(dst(name)) and not same(name):
+                    target = _clash_name(name, nick,
+                                         lambda n: os.path.isfile(dst(n)) and not same(n))
+                    renamed[atom.value] = target
+                if not os.path.isfile(dst(target)):
+                    out = _rename_footprint(mod, target) if target != name else mod
+                    if how == "copied" and target == name:
+                        session.wrote_new_file(dst(target))
+                        shutil.copy2(src_file, dst(target))
+                        session.written(dst(target))
+                    else:
+                        _write_rebuilt(session, dst(target), out)
+                    if how == "copied":
+                        copied += 1
+                    else:
+                        rebuilt += 1
+                new_name[atom.value] = target
+            new_id = "{}:{}".format(pnick, new_name[atom.value])
+            editor.replace_atom(atom, new_id, force_quote=True)
+            entries[pnick] = puri
             remapped += 1
             ref = _prop(fp, "Reference")
             if ref:
-                moved[ref] = (atom.value, "{}:{}".format(local_nick, name))
+                moved[ref] = (atom.value, new_id)
         write_validated(session, pcb, editor.result())
 
     add_lib_entries(session, "fp", entries)
     sch = _sync_schematic_footprints(session, moved)
+    new_ids = {old: "{}:{}".format(pnick, n) for old, n in new_name.items()}
+    defaults = _sync_symbol_library_footprints(session, new_ids)
+    cached = _sync_cached_footprints(session, new_ids)
+    dropped = _drop_merged_libraries(session, "fp")
     return {"libraries": len(entries), "files_copied": copied, "remapped": remapped,
-            "rebuilt_from_board": rebuilt,
-            "schematic_fields": sch["updated"], "schematic_skipped": sch["skipped"]}
+            "rebuilt_from_board": rebuilt, "renamed": renamed,
+            "schematic_fields": sch["updated"], "schematic_skipped": sch["skipped"],
+            "library_footprint_fields": defaults, "cached_footprint_fields": cached,
+            "libraries_merged": dropped}
+
+
+def _sync_symbol_library_footprints(session, new_id):
+    """Point the default Footprint fields of the project's own symbol
+    libraries at the moved footprints ({old fpid: new fpid}), so a symbol
+    placed afresh gets the project footprint. Returns fields changed."""
+    project_dir = session.project_dir
+    resolve = make_resolver(project_dir)
+    changed = 0
+    if not new_id:
+        return 0
+    for uri in parse_lib_table(os.path.join(project_dir, "sym-lib-table")).values():
+        if "${KIPRJMOD}" not in uri:
+            continue
+        lib = resolve(uri)
+        if not (os.path.isfile(lib) or os.path.isdir(lib)):
+            continue
+        for f in _library_files(lib):
+            text = _read(f)
+            try:
+                root = sexpr.parse(text)
+            except sexpr.SExprError:
+                continue
+            ed = sexpr.Editor(text)
+            n = 0
+            for c in root.iter_lists():
+                if (c.head() == "property" and len(c.children) >= 3
+                        and c.children[1].value == "Footprint"):
+                    v = c.children[2].value
+                    hits = ({new_id[v]} if v in new_id else
+                            {nw for o, nw in new_id.items() if _same_footprint(v, o)})
+                    if len(hits) == 1 and v not in hits:
+                        ed.replace_atom(c.children[2], hits.pop(), force_quote=True)
+                        n += 1
+            if n:
+                write_validated(session, f, ed.result())
+                changed += n
+    return changed
+
+
+def _referenced_nicks(project_dir, kind):
+    """Library nicknames the project's boards and schematics still use:
+    footprint ids and Footprint fields ("fp"), or symbol lib_ids ("sym")."""
+    used = set()
+    if kind == "fp":
+        for pcb in glob.glob(os.path.join(project_dir, "*.kicad_pcb")):
+            for fp in sexpr.parse(_read(pcb)).find_all("footprint"):
+                if fp.children[1:] and ":" in (fp.children[1].value or ""):
+                    used.add(fp.children[1].value.split(":", 1)[0])
+    for sch in glob.glob(os.path.join(project_dir, "*.kicad_sch")):
+        root = sexpr.parse(_read(sch))
+        for sym in _symbol_instances(root):
+            if kind == "sym":
+                lid = sym.find("lib_id").children[1].value
+                if ":" in lid:
+                    used.add(lid.split(":", 1)[0])
+            else:
+                v = _prop(sym, "Footprint")
+                if v and ":" in v:
+                    used.add(v.split(":", 1)[0])
+    return used
+
+
+def _drop_merged_libraries(session, kind):
+    """Remove the project's other ${KIPRJMOD} libraries that nothing uses any
+    more now their parts are in the project library: their lib-table entry
+    and their files (backed up, so Revert brings them back). Returns the
+    nicknames removed."""
+    project_dir = session.project_dir
+    resolve = make_resolver(project_dir)
+    pnick = project_nick(project_dir)
+    table_name = "fp-lib-table" if kind == "fp" else "sym-lib-table"
+    path = os.path.join(project_dir, table_name)
+    used = _referenced_nicks(project_dir, kind)
+    gone = sorted(n for n, uri in parse_lib_table(path).items()
+                  if "${KIPRJMOD}" in uri and n != pnick and n not in used)
+    if not gone:
+        return []
+    text = _read(path)
+    root = sexpr.parse(text)
+    ed = sexpr.Editor(text)
+    uris = {}
+    for lib in root.find_all("lib"):
+        nm, uri = lib.find("name"), lib.find("uri")
+        if nm and nm.children[1:] and nm.children[1].value in gone:
+            uris[nm.children[1].value] = uri.children[1].value if uri and uri.children[1:] else ""
+            _delete_span(ed, text, lib)
+    write_validated(session, path, ed.result())
+    proot = os.path.normcase(os.path.abspath(project_dir))
+    for n in gone:
+        lib = resolve(uris.get(n, ""))
+        if not lib or not os.path.normcase(os.path.abspath(lib)).startswith(proot + os.sep):
+            continue    # never delete anything outside the project
+        files = ([os.path.join(lib, f) for f in os.listdir(lib)
+                  if f.lower().endswith((".kicad_mod", ".kicad_sym"))]
+                 if os.path.isdir(lib) else [lib] if os.path.isfile(lib) else [])
+        for f in files:
+            session.backup(f)
+            os.remove(f)
+        if os.path.isdir(lib) and not os.listdir(lib):
+            os.rmdir(lib)
+    return gone
 
 
 def _symbol_refs(sym):
@@ -1514,6 +1708,53 @@ def _symbol_refs(sym):
             if lst.head() == "reference" and lst.children[1:]:
                 refs.add(lst.children[1].value)
     return refs
+
+
+def _same_footprint(a, b):
+    """True when footprint ids a and b name one footprint, one through its
+    original library and the other through an earlier run's copy of it
+    (Lib:X and Lib_local:X)."""
+    if ":" not in a or ":" not in b:
+        return False
+    (na, xa), (nb, xb) = a.split(":", 1), b.split(":", 1)
+    return xa == xb and (na + LOCAL_SUFFIX == nb or nb + LOCAL_SUFFIX == na)
+
+
+def _sync_cached_footprints(session, new_id):
+    """The Footprint fields of the schematics' lib_symbols copies follow the
+    moved footprints ({old fpid: new fpid}, also matching Lib:X for a moved
+    Lib_local:X), as the project symbol library's defaults do -- else every
+    such symbol reads as out of step with its library. Returns fields
+    changed."""
+    changed = 0
+    if not new_id:
+        return 0
+
+    def target(v):
+        if v in new_id:
+            return new_id[v]
+        hits = {n for o, n in new_id.items() if _same_footprint(v, o)}
+        return hits.pop() if len(hits) == 1 else None
+    for sch in sorted(glob.glob(os.path.join(session.project_dir, "*.kicad_sch"))):
+        text = _read(sch)
+        root = sexpr.parse(text)
+        ls = root.find("lib_symbols")
+        if ls is None:
+            continue
+        ed = sexpr.Editor(text)
+        n = 0
+        for entry in ls.find_all("symbol"):
+            for c in entry.children:
+                if (c.kind == "list" and c.head() == "property" and len(c.children) >= 3
+                        and c.children[1].value == "Footprint"):
+                    t = target(c.children[2].value)
+                    if t and t != c.children[2].value:
+                        ed.replace_atom(c.children[2], t, force_quote=True)
+                        n += 1
+        if n:
+            write_validated(session, sch, ed.result())
+            changed += n
+    return changed
 
 
 def _sync_schematic_footprints(session, moved):
@@ -1554,7 +1795,7 @@ def _sync_schematic_footprints(session, moved):
             if any(on_board.get(x) != new for x in _symbol_refs(sym) if x in on_board):
                 skipped += 1    # a sheet instance still uses another footprint
                 continue
-            if field.value == old:
+            if field.value == old or _same_footprint(field.value, old):
                 editor.replace_atom(field, new, force_quote=True)
                 updated += 1
                 touched = True
@@ -1958,97 +2199,197 @@ def update_symbols(session, rows):
             "schematic_copies": entries}
 
 
+# Library files older than this read a "~" field value as empty; KiCad 10
+# files keep it literally. A definition moved from an older file into the
+# (KiCad 10) project library has its "~" values emptied, or KiCad reads
+# Datasheet "~" and flags every placed copy as differing from the library.
+_TILDE_EMPTY_BEFORE = 20251024
+
+
+def _symbol_blocks(lib):
+    """{name: (definition text, extends parent)} of a .kicad_sym file or a
+    folder library, "~" field values emptied for pre-KiCad 10 files."""
+    out = {}
+    for f in _library_files(lib):
+        text = _read(f)
+        try:
+            root = sexpr.parse(text)
+        except sexpr.SExprError:
+            continue
+        ver = root.find("version")
+        try:
+            old = int(ver.children[1].value) < _TILDE_EMPTY_BEFORE
+        except (AttributeError, IndexError, TypeError, ValueError):
+            old = True
+        for s in root.find_all("symbol"):
+            if s.children[1:] and s.children[1].kind == "atom":
+                ext = s.find("extends")
+                block = text[s.start:s.end]
+                if old:
+                    block = re.sub(r'(\(property\s+"[^"]*"\s+)"~"', r'\1""', block)
+                out[s.children[1].value] = (block,
+                                            ext.children[1].value if ext and ext.children[1:] else None)
+    return out
+
+
+def _rename_symbol_block(text, old, new):
+    """A symbol definition renamed, its unit sub-symbols (<name>_U_B) too."""
+    if old == new:
+        return text
+    text = text.replace("(symbol {}".format(sexpr.quote(old)), "(symbol {}".format(sexpr.quote(new)), 1)
+    return re.sub(r'\(symbol "{}_(\d+_\d+)"'.format(re.escape(old)),
+                  lambda m: '(symbol "{}_{}"'.format(new, m.group(1)), text)
+
+
+def _symbol_body(text):
+    """A definition compared without its names and layout."""
+    t = re.sub(r'\(symbol "[^"]*"', "(symbol", text)
+    return " ".join(t.split())
+
+
+_SYMLIB_HEAD = ('(kicad_symbol_lib\n\t(version 20251024)\n\t(generator "kicad_symbol_editor")\n'
+                '\t(generator_version "10.0")\n')
+
+
+def _add_symbols(session, lib, blocks):
+    """Append definitions [(name, text)] to the project symbol library `lib`:
+    a .kicad_sym file (created if missing) or a folder library (one file per
+    symbol)."""
+    if not blocks:
+        return
+    if os.path.isdir(lib) or lib.endswith(".kicad_symdir"):
+        session.mkdir(lib)
+        for name, t in blocks:
+            f = os.path.join(lib, re.sub(r'[\\/:*?"<>|]', "_", name) + ".kicad_sym")
+            write_validated(session, f, _SYMLIB_HEAD + "\t" + t + "\n)\n", is_new=True)
+        return
+    add = "".join("\t" + t + "\n" for _n, t in blocks)
+    if os.path.isfile(lib):
+        text = _read(lib)
+        close = sexpr.parse(text).end - 1
+        nl = "\r\n" if "\r\n" in text else "\n"
+        body = text[:close].rstrip(" \t\r\n") + nl
+        write_validated(session, lib, body + add.replace("\n", nl) + text[close:])
+    else:
+        session.mkdir(os.path.dirname(lib))
+        write_validated(session, lib, _SYMLIB_HEAD + add + ")\n", is_new=True)
+
+
 def localize_symbols(session, rows):
-    """Localize the libraries of the selected symbols. `rows` are the selected
-    scan_items() rows of type 'symbol'.
+    """Copy the selected symbols into the project's one symbol library
+    (project_lib: libs/<project>.kicad_sym), register it in sym-lib-table,
+    and remap them. `rows` are the selected scan_items() rows of type
+    'symbol'.
 
-    Symbols localize per library, not per instance: selecting any symbol of a
-    library copies the whole .kicad_sym (so derived symbols keep their 'extends'
-    parents) and remaps every instance of that library plus its lib_symbols
-    cache entries together. Splitting one library across two nicknames would
-    leave the embedded symbol cache inconsistent, so we keep it whole.
-
-    A folder library (KiCad 10: one .kicad_sym per symbol, usually named
-    *.kicad_symdir) is copied as a folder of its top-level *.kicad_sym files,
-    which is what KiCad reads. A library whose source can't be found is left
+    Symbols move per lib_id: every placed instance of a selected lib_id and
+    its schematic lib_symbols copy move together (two names for one cached
+    definition would leave the cache inconsistent). A derived symbol brings
+    its 'extends' parents along. A symbol already in the project library
+    under the same name is reused when identical; a different one is renamed
+    <name>_<source library>. Symbols of other project libraries ("merge")
+    move the same way, and a project library left unused is dropped
+    (_drop_merged_libraries). A library whose source can't be found is left
     alone rather than remapped to a copy that doesn't exist."""
     project_dir = session.project_dir
     resolve = make_resolver(project_dir)
+    pnick, puri, plib = project_lib(project_dir, "sym")
 
-    nicks = set()
+    wanted = {}             # nick -> {selected names}
     for r in rows:
         if r["type"] == "symbol" and ":" in r["name"]:
-            nicks.add(r["name"].split(":", 1)[0])
-    if not nicks:
-        return {"libraries": 0, "files_copied": 0, "remapped": 0}
+            nick, name = r["name"].split(":", 1)
+            if nick != pnick:
+                wanted.setdefault(nick, set()).add(name)
+    if not wanted:
+        return {"libraries": 0, "symbols_copied": 0, "remapped": 0}
 
-    src_file = {}   # nick -> resolved source .kicad_sym file or library folder
-    for nick in nicks:
+    sources = {}            # nick -> {name: (text, parent)}
+    for nick in wanted:
         uri = resolve_lib_uri(project_dir, "sym-lib-table", nick)
-        if uri:
-            path = resolve(uri)
-            if os.path.isfile(path) or os.path.isdir(path):
-                src_file[nick] = path
-    if not src_file:
-        return {"libraries": 0, "files_copied": 0, "remapped": 0}
+        path = resolve(uri) if uri else ""
+        if os.path.isfile(path) or os.path.isdir(path):
+            sources[nick] = _symbol_blocks(path)
+    if not sources:
+        return {"libraries": 0, "symbols_copied": 0, "remapped": 0}
 
-    entries = {}
-    local_libs = {}         # nick -> the local copy
-    copied = 0
-    for nick, sfile in src_file.items():
-        local_nick = nick + LOCAL_SUFFIX
-        if os.path.isdir(sfile):
-            ext = os.path.splitext(sfile.rstrip("/\\"))[1] or ".kicad_symdir"
-            local_name = local_nick + ext
-            local_lib = os.path.join(project_dir, LOCAL_LIB_DIRNAME, local_name)
-            if not os.path.exists(local_lib):
-                session.mkdir(local_lib)
-                for f in sorted(os.listdir(sfile)):
-                    src = os.path.join(sfile, f)
-                    if f.lower().endswith(".kicad_sym") and os.path.isfile(src):
-                        dst = os.path.join(local_lib, f)
-                        session.wrote_new_file(dst)
-                        shutil.copy2(src, dst)
-                        session.written(dst)
-                        copied += 1
-        else:
-            local_name = local_nick + ".kicad_sym"
-            local_lib = os.path.join(project_dir, LOCAL_LIB_DIRNAME, local_name)
-            session.mkdir(os.path.dirname(local_lib))
-            if not os.path.isfile(local_lib):
-                session.wrote_new_file(local_lib)
-                shutil.copy2(sfile, local_lib)
-                session.written(local_lib)
-                copied += 1
-        entries[local_nick] = "${{KIPRJMOD}}/{}/{}".format(LOCAL_LIB_DIRNAME, local_name)
-        local_libs[nick] = local_lib
+    have = _symbol_blocks(plib) if (os.path.isfile(plib) or os.path.isdir(plib)) else {}
+    have_body = {n: _symbol_body(t) for n, (t, _p) in have.items()}
+    new_name = {}           # (nick, name) -> name in the project library
+    renamed = {}
+    adding = []             # [(nick, name)] in dependency order: parents first
 
-    # The local copy follows the placed symbols: fields changed, added or
-    # deleted on every one of them (symbol_updates).
+    def take(nick, name, seen=()):
+        if (nick, name) in new_name or name not in sources[nick] or name in seen:
+            return
+        text, parent = sources[nick][name]
+        if parent:
+            take(nick, parent, seen + (name,))
+        if parent and (nick, parent) in new_name:
+            text = text.replace('(extends {})'.format(sexpr.quote(parent)),
+                                '(extends {})'.format(sexpr.quote(new_name[(nick, parent)])))
+        body = _symbol_body(text)
+        target = name
+        if target in have_body and have_body[target] != body:
+            target = _clash_name(name, nick,
+                                 lambda n: n in have_body and have_body[n] != body)
+            renamed["{}:{}".format(nick, name)] = target
+        new_name[(nick, name)] = target
+        if target not in have_body:
+            have_body[target] = body
+            adding.append((target, _rename_symbol_block(text, name, target)))
+
+    for nick in sorted(sources):
+        for name in sorted(wanted[nick]):
+            take(nick, name)
+    _add_symbols(session, plib, adding)
+
+    # Remap placed symbols and the schematics' lib_symbols copies.
     schematics = glob.glob(os.path.join(project_dir, "*.kicad_sch"))
-    placed = _placed_by_library(schematics)
-    synced = {}             # nick -> (defs, updates)
+    remapped = 0
+    moved = {"{}:{}".format(*k): v for k, v in new_name.items() if k[1] in wanted.get(k[0], ())}
+    for sch in schematics:
+        text = _read(sch)
+        root = sexpr.parse(text)
+        ed = sexpr.Editor(text)
+        n = 0
+        for sym in _symbol_instances(root):
+            a = sym.find("lib_id").children[1]
+            if a.value in moved:
+                ed.replace_atom(a, "{}:{}".format(pnick, moved[a.value]), force_quote=True)
+                n += 1
+        ls = root.find("lib_symbols")
+        for entry in (ls.find_all("symbol") if ls else []):
+            a = entry.children[1] if entry.children[1:] else None
+            if a is None or a.value not in moved:
+                continue
+            old = a.value.split(":", 1)[1]
+            new = moved[a.value]
+            ed.replace_atom(a, "{}:{}".format(pnick, new), force_quote=True)
+            if new != old:
+                for sub in entry.find_all("symbol"):
+                    s = sub.children[1]
+                    if s.value.startswith(old + "_"):
+                        ed.replace_atom(s, new + s.value[len(old):], force_quote=True)
+            n += 1
+        if n:
+            write_validated(session, sch, ed.result())
+            remapped += n
+
+    add_lib_entries(session, "sym", {pnick: puri})
+
+    # The copies follow the placed symbols: fields changed, added or deleted
+    # on every one of them (symbol_updates) -- only for the symbols moved now.
     fields_changed = 0
-    for nick, lib in local_libs.items():
-        defs, updates, n = _sync_library(session, lib, placed.get(nick, {}))
-        synced[nick] = (defs, updates)
-        fields_changed += n
-
-    def remap(editor, atom):
-        if atom.kind != "atom" or ":" not in atom.value:
-            return False
-        nick, name = atom.value.split(":", 1)
-        if nick not in src_file:
-            return False
-        editor.replace_atom(atom, "{}:{}".format(nick + LOCAL_SUFFIX, name),
-                            force_quote=True)
-        return True
-
-    remapped, _ = _sync_schematic_caches(session, schematics, synced, rename=remap)
-
-    add_lib_entries(session, "sym", entries)
-    return {"libraries": len(entries), "files_copied": copied, "remapped": remapped,
-            "fields_changed": fields_changed}
+    if os.path.isfile(plib) or os.path.isdir(plib):
+        placed = _placed_by_library(schematics).get(pnick, {})
+        mine = set(moved.values())
+        defs, updates, fields_changed = _sync_library(
+            session, plib, {k: v for k, v in placed.items() if k in mine})
+        _sync_schematic_caches(session, schematics, {pnick: (defs, updates)})
+    dropped = _drop_merged_libraries(session, "sym")
+    return {"libraries": 1, "symbols_copied": len(adding), "remapped": remapped,
+            "renamed": renamed, "fields_changed": fields_changed,
+            "libraries_merged": dropped}
 
 
 # --- dispatcher --------------------------------------------------------------
@@ -2065,7 +2406,12 @@ def apply_selection(session, rows):
     rows = [r for r in rows if r["key"][0] != "libmodel"]
     models = [r for r in rows if r["type"] == "model" and r["status"] != "embedded"]
     embedded = [r for r in rows if r["type"] == "model" and r["status"] == "embedded"]
-    # Footprints first: they may rewrite the schematic Footprint fields that
+    # Models inside project footprint libraries before the footprints: a
+    # merge moves those library files into the project library (and removes
+    # the old one), carrying the localized model paths with them.
+    if libmodels:
+        result["library_models"] = localize_library_models(session, libmodels)
+    # Footprints next: they may rewrite the schematic Footprint fields that
     # the symbol libraries are then brought in line with.
     if fps:
         result["footprints"] = localize_footprints(session, fps)
@@ -2077,8 +2423,6 @@ def apply_selection(session, rows):
         result["models"] = localize_models(session, models)
     if embedded:
         result["embedded"] = localize_embedded_models(session, embedded)
-    if libmodels:
-        result["library_models"] = localize_library_models(session, libmodels)
     nested = [r for r in models + libmodels if r["status"] == "nested"]
     if nested:
         result["subfolders"] = _drop_unused_nested(session, nested)

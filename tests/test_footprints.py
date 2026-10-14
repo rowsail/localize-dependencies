@@ -1,7 +1,9 @@
-# Footprint localization keeps the schematic in step: the symbols' Footprint
-# fields follow the board, so "Update PCB from Schematic" doesn't swap the
-# footprints back to the global library. Footprints whose library file is
-# missing are left alone.
+# Footprint localization: everything goes into ONE project library,
+# libs/<project>.pretty (here the project folder is "proj"), and keeps the
+# schematic in step: the symbols' Footprint fields follow the board, so
+# "Update PCB from Schematic" doesn't swap the footprints back to the global
+# library. Footprints whose library file is missing are rebuilt from the
+# board.
 #
 # Run: python tests/test_footprints.py   (or pytest)
 
@@ -73,7 +75,7 @@ def test_schematic_field_follows_the_board():
         before_sub = _bytes(os.path.join(proj, "sub.kicad_sch"))
         res = _run(proj, _fp_rows(proj, {"R1"}))["footprints"]
         assert res["schematic_fields"] == 1 and res["schematic_skipped"] == 0, res
-        assert '(property "Footprint" "Lib_local:R")' in _sch(proj, "board.kicad_sch")
+        assert '(property "Footprint" "proj:R")' in _sch(proj, "board.kicad_sch")
         assert _bytes(os.path.join(proj, "sub.kicad_sch")) == before_sub, \
             "R2/R3 were not localized: their symbol stays as it was"
         res = portability.revert(proj)
@@ -91,7 +93,7 @@ def test_shared_symbol_changes_only_when_every_instance_moves():
         assert '"Lib:R"' in _sch(proj, "sub.kicad_sch"), "R3 still uses Lib:R"
         res = _run(proj, _fp_rows(proj, {"R3"}))["footprints"]
         assert res["schematic_fields"] == 1, res
-        assert '(property "Footprint" "Lib_local:R")' in _sch(proj, "sub.kicad_sch")
+        assert '(property "Footprint" "proj:R")' in _sch(proj, "sub.kicad_sch")
     finally:
         shutil.rmtree(root)
 
@@ -104,10 +106,10 @@ def test_missing_footprint_is_rebuilt_from_the_board():
         assert rows and rows[0]["status"] == "rebuild" and rows[0]["wanted"], rows
         res = _run(proj, rows)["footprints"]
         assert res["rebuilt_from_board"] == 1 and res["remapped"] == 1, res
-        mod = os.path.join(proj, "libs", "Lib_local.pretty", "Gone.kicad_mod")
+        mod = os.path.join(proj, "libs", "proj.pretty", "Gone.kicad_mod")
         assert os.path.isfile(mod)
-        assert '(footprint "Lib_local:Gone"' in open(pcb, encoding="utf-8").read()
-        assert '"Lib_local:Gone"' in _sch(proj, "board.kicad_sch")
+        assert '(footprint "proj:Gone"' in open(pcb, encoding="utf-8").read()
+        assert '"proj:Gone"' in _sch(proj, "board.kicad_sch")
         res = portability.revert(proj)
         assert res["errors"] == [], res
         assert not os.path.exists(mod)
@@ -115,20 +117,25 @@ def test_missing_footprint_is_rebuilt_from_the_board():
         shutil.rmtree(root)
 
 
-def test_missing_file_in_a_project_library_is_restored_in_place():
+def _add_project_lib(proj, nick):
+    lp = os.path.join(proj, "libs", nick + ".pretty")
+    os.makedirs(lp)
+    with open(os.path.join(proj, "fp-lib-table"), encoding="utf-8") as fh:
+        t = fh.read()
+    t = t.rstrip()[:-1] + ('\t(lib (name "{0}")(type "KiCad")'
+                           '(uri "${{KIPRJMOD}}/libs/{0}.pretty")(options "")(descr ""))\n)\n'.format(nick))
+    _write(os.path.join(proj, "fp-lib-table"), t)
+    return lp
+
+
+def test_missing_file_in_the_project_library_is_restored_in_place():
     root, proj = _project()
     try:
-        lp = os.path.join(proj, "libs", "Mine.pretty")
-        os.makedirs(lp)
-        with open(os.path.join(proj, "fp-lib-table"), encoding="utf-8") as fh:
-            t = fh.read()
-        t = t.rstrip()[:-1] + ('\t(lib (name "Mine")(type "KiCad")'
-                               '(uri "${KIPRJMOD}/libs/Mine.pretty")(options "")(descr ""))\n)\n')
-        _write(os.path.join(proj, "fp-lib-table"), t)
+        lp = _add_project_lib(proj, "proj")
         pcb = os.path.join(proj, "board.kicad_pcb")
         with open(pcb, encoding="utf-8") as fh:
             b = fh.read()
-        _write(pcb, b.replace('"Lib:Gone"', '"Mine:Gone"'))
+        _write(pcb, b.replace('"Lib:Gone"', '"proj:Gone"'))
         before = _bytes(pcb)
         rows = _fp_rows(proj, {"X1"})
         assert rows[0]["status"] == "rebuild", rows
@@ -138,6 +145,68 @@ def test_missing_file_in_a_project_library_is_restored_in_place():
         assert _bytes(pcb) == before, "the footprint id was already right"
         assert portability.revert(proj)["errors"] == []
         assert not os.path.exists(os.path.join(lp, "Gone.kicad_mod"))
+    finally:
+        shutil.rmtree(root)
+
+
+def test_other_project_library_is_merged_and_removed():
+    """An earlier run's libs/Lib_local.pretty: its footprints move into
+    libs/proj.pretty, the board and schematic follow, and the emptied library
+    leaves the table and the disk -- until Revert."""
+    root, proj = _project()
+    try:
+        lp = _add_project_lib(proj, "Lib_local")
+        _write(os.path.join(lp, "R.kicad_mod"), '(footprint "R")\n')
+        pcb = os.path.join(proj, "board.kicad_pcb")
+        sch = os.path.join(proj, "board.kicad_sch")
+        for f in (pcb, sch):
+            with open(f, encoding="utf-8") as fh:
+                b = fh.read()
+            _write(f, b.replace('"Lib:R"', '"Lib_local:R"', 1))
+        before = {f: _bytes(f) for f in (pcb, sch, os.path.join(proj, "fp-lib-table"))}
+        rows = _fp_rows(proj, {"R1"})
+        assert rows[0]["status"] == "merge" and rows[0]["wanted"], rows
+        res = _run(proj, rows)["footprints"]
+        assert res["remapped"] == 1 and res["libraries_merged"] == ["Lib_local"], res
+        assert os.path.isfile(os.path.join(proj, "libs", "proj.pretty", "R.kicad_mod"))
+        assert '(footprint "proj:R"' in open(pcb, encoding="utf-8").read()
+        assert '"proj:R"' in _sch(proj, "board.kicad_sch")
+        table = open(os.path.join(proj, "fp-lib-table"), encoding="utf-8").read()
+        assert '"Lib_local"' not in table and '(uri "${KIPRJMOD}/libs/proj.pretty")' in table, table
+        assert not os.path.exists(lp)
+        assert portability.revert(proj)["errors"] == []
+        assert {f: _bytes(f) for f in before} == before
+        assert os.path.isfile(os.path.join(lp, "R.kicad_mod")), "Revert brings it back"
+    finally:
+        shutil.rmtree(root)
+
+
+def test_same_name_different_footprint_is_renamed():
+    """Two libraries both have an "R": the second, different, one becomes
+    R_Other; an identical one would simply be shared."""
+    root, proj = _project()
+    try:
+        other = os.path.join(root, "Other.pretty").replace("\\", "/")
+        _write(os.path.join(other, "R.kicad_mod"), '(footprint "R" (attr smd))\n')
+        same = os.path.join(root, "Same.pretty").replace("\\", "/")
+        _write(os.path.join(same, "R.kicad_mod"), '(footprint "R")\n')
+        t = open(os.path.join(proj, "fp-lib-table"), encoding="utf-8").read()
+        t = t.rstrip()[:-1] + "".join(
+            '\t(lib (name "{}")(type "KiCad")(uri "{}")(options "")(descr ""))\n'.format(n, u)
+            for n, u in (("Other", other), ("Same", same))) + ")\n"
+        _write(os.path.join(proj, "fp-lib-table"), t)
+        pcb = os.path.join(proj, "board.kicad_pcb")
+        b = open(pcb, encoding="utf-8").read()
+        b = b.replace('"Lib:R" (property "Reference" "R2")', '"Other:R" (property "Reference" "R2")')
+        b = b.replace('"Lib:R" (property "Reference" "R3")', '"Same:R" (property "Reference" "R3")')
+        _write(pcb, b)
+        res = _run(proj, _fp_rows(proj, {"R1", "R2", "R3"}))["footprints"]
+        assert res["renamed"] == {"Other:R": "R_Other"}, res
+        lib = os.path.join(proj, "libs", "proj.pretty")
+        assert sorted(os.listdir(lib)) == ["R.kicad_mod", "R_Other.kicad_mod"], os.listdir(lib)
+        assert open(os.path.join(lib, "R_Other.kicad_mod")).read().startswith('(footprint "R_Other"')
+        b = open(pcb, encoding="utf-8").read()
+        assert b.count('"proj:R"') == 2 and b.count('"proj:R_Other"') == 1, b
     finally:
         shutil.rmtree(root)
 
