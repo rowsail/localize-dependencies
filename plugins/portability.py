@@ -1507,7 +1507,7 @@ def localize_footprints(session, rows):
     restored = set()     # footprint ids rebuilt into their own project library
     flip = flip_direction()
     copied = remapped = rebuilt = 0
-    moved = {}          # board reference -> (old fpid, new fpid)
+    moved = {}          # (board, reference) -> (old fpid, new fpid, board)
     new_name = {}       # old fpid -> name in the project library
     renamed = {}
     for rel, kset in by_pcb.items():
@@ -1577,7 +1577,7 @@ def localize_footprints(session, rows):
             remapped += 1
             ref = _prop(fp, "Reference")
             if ref:
-                moved[ref] = (atom.value, new_id)
+                moved[(os.path.abspath(pcb), ref)] = (atom.value, new_id, os.path.abspath(pcb))
         write_validated(session, pcb, editor.result())
 
     add_lib_entries(session, "fp", entries)
@@ -1757,6 +1757,20 @@ def _sync_cached_footprints(session, new_id):
     return changed
 
 
+def _schematic_boards(project_dir):
+    """The boards the folder's schematics belong to: <name>.kicad_pcb of each
+    project (.kicad_pro) that has its own <name>.kicad_sch -- so a second
+    project's board in the same folder (one with no schematic, or another
+    schematic's) can't make the references disagree. All the boards when no
+    project pairs up."""
+    pairs = []
+    for pro in glob.glob(os.path.join(project_dir, "*.kicad_pro")):
+        stem = os.path.splitext(pro)[0]
+        if os.path.isfile(stem + ".kicad_sch") and os.path.isfile(stem + ".kicad_pcb"):
+            pairs.append(stem + ".kicad_pcb")
+    return pairs or glob.glob(os.path.join(project_dir, "*.kicad_pcb"))
+
+
 def _sync_schematic_footprints(session, moved):
     """Point the schematic symbols of moved footprints at the localized
     footprint: (property "Footprint" "Lib:X") -> "Lib_local:X". A symbol in a
@@ -1767,8 +1781,10 @@ def _sync_schematic_footprints(session, moved):
     updated = skipped = 0
     if not moved:
         return {"updated": 0, "skipped": 0}
+    boards = [os.path.abspath(b) for b in _schematic_boards(session.project_dir)]
+    moved = {k[1]: v[:2] for k, v in moved.items() if v[2] in boards}
     on_board = {}       # reference -> footprint id, as the boards are now
-    for pcb in glob.glob(os.path.join(session.project_dir, "*.kicad_pcb")):
+    for pcb in boards:
         for fp in sexpr.parse(_read(pcb)).find_all("footprint"):
             ref = _prop(fp, "Reference")
             if ref and fp.children[1:] and fp.children[1].kind == "atom":
